@@ -80,7 +80,7 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
   def generate(xfmr_weights, model_params, tokens):
     gen_tokens = None
     cur_pos = 0
-    with mesh:  # Move mesh context to cover all tensor operations
+    with mesh:
         tokens = jnp.array([tokens], jnp.int32)
         bsz, seqlen = tokens.shape
         attn_mask = build_attn_mask(seqlen, cur_pos)
@@ -97,7 +97,7 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
             model_params.n_local_kv_heads, 
             model_params.head_dim
         )
-        logits, kvcache, _, _ = xfmr_fn(
+        logits, kvcache, scores, stats = xfmr_fn(
             xfmr_weights, 
             model_params, 
             tokens, 

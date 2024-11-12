@@ -68,4 +68,5 @@ def xfmr(xfmr_weights: XfmrWeights, model_params: ModelParams, tokens: jax.Array
     h = h + h_attn
     h = h + feed_forward(rms_norm(h, xfmr_weights.layer_weights[i].ffn_norm), xfmr_weights.layer_weights[i])
   logits = jnp.dot(rms_norm(h, xfmr_weights.norm), xfmr_weights.output.T)
-  return logits, kvcache, scores
+  stats = None if attn_mask is None else {}
+  return logits, kvcache, scores, stats
