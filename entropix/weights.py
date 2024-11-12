@@ -89,8 +89,8 @@ def load_weights(
           model_params.n_local_heads if "wq" in name else model_params.n_local_kv_heads,
           model_params.head_dim,
         )
-    # print(name, weight.shape, sharding._to_xla_hlo_sharding(weight.ndim))
-    w[name] = jax.device_put(weight, sharding)
+    #print(name, weight.shape, sharding._to_xla_hlo_sharding(weight.ndim))
+    w[name] = jax.device_put(weight)
 
   for i in range(model_params.n_layers):
     layer_weights.append(

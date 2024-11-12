@@ -75,3 +75,6 @@ def create_model_params(config: ModelConfig) -> ModelParams:
     rope_theta=config.rope_theta,
     use_scaled_rope=config.use_scaled_rope,
   )
+
+LLAMA_1B_PARAMS = create_model_params(MODEL_CONFIGS["1B"])
+LLAMA_70B_PARAMS = create_model_params(MODEL_CONFIGS["70B"])

@@ -32,7 +32,7 @@ class SamplerConfig:
   high_scaffold_varentropy_threshold = 0.8
 
 
-@partial(jax.jit, static_argnames=("config",))
+@partial(jax.jit)
 def sample(
   state: DSState,
   logits: jnp.ndarray,
