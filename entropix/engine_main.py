@@ -37,18 +37,19 @@ async def run(
   tokenizer_path: str = "entropix/tokenizer.model",
 ):
   model_params = LLAMA_1B_PARAMS
-  xfmr_weights = load_weights(ckpt_path, n_layers=model_params.n_layers)
+  xfmr_weights, mesh = load_weights(ckpt_path, model_params)
   tokenizer = Tokenizer(tokenizer_path)
   xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
   sample_fn = jax.jit(sample)
-  num_engines = 1  # TODO(xjdr): this should probably be num devices as well
+
+  num_engines = jax.device_count()
   driver = Driver(
     prefill_engines=[
-      EntropixEngine(model_params, xfmr_weights, tokenizer, xfmr_fn, sample_fn)
+      EntropixEngine(model_params, xfmr_weights, mesh, tokenizer, xfmr_fn, sample_fn)
       for _ in range(num_engines)
     ],
     generate_engines=[
-      EntropixEngine(model_params, xfmr_weights, tokenizer, xfmr_fn, sample_fn)
+      EntropixEngine(model_params, xfmr_weights, mesh, tokenizer, xfmr_fn, sample_fn)
       for _ in range(num_engines)
     ],
     prefill_params=[model_params] * num_engines,

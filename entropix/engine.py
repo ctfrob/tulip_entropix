@@ -476,7 +476,7 @@ class EntropixEngine:
     new_cache = KVCache(k=new_k, v=new_v)
 
     return {
-      "logits": prefix["logits"],
+      "logits": prefix["l ogits"],
       "cache": new_cache,
       "next_pos": prefix["next_pos"],
       "generated_tokens": prefix["generated_tokens"],

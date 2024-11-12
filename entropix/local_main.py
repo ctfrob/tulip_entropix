@@ -5,16 +5,20 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import Mesh
+from jax.experimental import mesh_utils
 import tyro
 
-from entropix.config import LLAMA_1B_PARAMS
+from entropix.config import MODEL_CONFIGS, create_model_params
 from entropix.kvcache import KVCache
 from entropix.model import xfmr
 from entropix.sampler import SamplerConfig, sample
-from entropix.prompts import create_prompts_from_csv, prompt6, p4o
+from entropix.prompts import generate_chat_prompt
 from entropix.sampler import sample
 from entropix.tokenizer import Tokenizer
 from entropix.weights import load_weights
+from entropix.dslider import initialize_state
+from entropix.dslider_config import DEFAULT_DS_CONFIG
 
 DEFAULT_WEIGHTS_PATH = Path(__file__).parent / '../weights'
 
@@ -62,38 +66,69 @@ def build_attn_mask(seqlen: int, start_pos: int) -> jax.Array:
   return mask
 
 def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
-#def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instruct')):
-  model_params = LLAMA_1B_PARAMS
-  xfmr_weights = load_weights(weights_path.absolute(), n_layers=model_params.n_layers)
+  #def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instruct')):
+  model_config = MODEL_CONFIGS["1B"]
+  model_params = create_model_params(model_config)
+    
+  # Get both weights and mesh
+  xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
   tokenizer = Tokenizer('entropix/tokenizer.model')
   xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
-  sample_fn = jax.jit(sample, static_argnames=("cfg",))
+  sample_fn = jax.jit(sample, static_argnames=("config",))
 
   # Create the batch of tokens
   def generate(xfmr_weights, model_params, tokens):
     gen_tokens = None
     cur_pos = 0
-    tokens = jnp.array([tokens], jnp.int32)
-    bsz, seqlen = tokens.shape
-    attn_mask = build_attn_mask(seqlen, cur_pos)
-    freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
-    kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
-    logits, kvcache, _, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-    next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
-    print(tokenizer.decode([next_token.item()]), end='', flush=True)
-    cur_pos = seqlen
-    stop = jnp.array([128001, 128008, 128009])
-    sampler_cfg = SamplerConfig()
-    gen_tokens = [next_token]
-    while cur_pos < 8192:
-      cur_pos += 1
-      logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-      next_token = sample(logits, scores, cur_pos, cfg=sampler_cfg)
-      gen_tokens.append(next_token)
-      out_token = tokenizer.decode(next_token.tolist()[0])
-      print(out_token, end='', flush=True)
-      if jnp.isin(next_token, stop).any():
-        break
+    with mesh:  # Move mesh context to cover all tensor operations
+        tokens = jnp.array([tokens], jnp.int32)
+        bsz, seqlen = tokens.shape
+        attn_mask = build_attn_mask(seqlen, cur_pos)
+        freqs_cis = precompute_freqs_cis(
+            model_params.head_dim, 
+            model_params.max_seq_len, 
+            model_params.rope_theta, 
+            model_params.use_scaled_rope
+        )
+        kvcache = KVCache.new(
+            model_params.n_layers, 
+            bsz, 
+            model_params.max_seq_len, 
+            model_params.n_local_kv_heads, 
+            model_params.head_dim
+        )
+        logits, kvcache, _, _ = xfmr_fn(
+            xfmr_weights, 
+            model_params, 
+            tokens, 
+            cur_pos, 
+            freqs_cis[:seqlen], 
+            kvcache, 
+            attn_mask=attn_mask
+        )
+        next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
+        print(tokenizer.decode([next_token.item()]), end='', flush=True)
+        cur_pos = seqlen
+        stop = jnp.array([128001, 128008, 128009])
+        sampler_cfg = SamplerConfig()
+        gen_tokens = [next_token]
+        
+        while cur_pos < 8192:
+            cur_pos += 1
+            logits, kvcache, scores, stats = xfmr_fn(
+                xfmr_weights, 
+                model_params, 
+                next_token, 
+                cur_pos, 
+                freqs_cis[cur_pos:cur_pos+1], 
+                kvcache
+            )
+            next_token = sample(logits, scores, cur_pos, cfg=sampler_cfg)
+            gen_tokens.append(next_token)
+            out_token = tokenizer.decode(next_token.tolist()[0])
+            print(out_token, end='', flush=True)
+            if jnp.isin(next_token, stop).any():
+                break
 
   prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 

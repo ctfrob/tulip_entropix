@@ -1,248 +1,280 @@
-from functools import partial
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-import jax.scipy.special as jsp
+from jax.tree_util import register_pytree_node_class
+import math
+
+# Constants
+MIN_TEMP = 1e-4
+MAX_TEMP = 1e4
+EPS = 1e-8
+VOCAB_SIZE = 128256
 
 
-@jax.jit
-def sample_dirichlet(key: jax.random.PRNGKey, alpha: jnp.ndarray) -> jnp.ndarray:
-  """Sample from a Dirichlet distribution."""
-  gamma_samples = jax.random.gamma(key, alpha, shape=alpha.shape)
-  return gamma_samples / jnp.sum(gamma_samples, axis=-1, keepdims=True)
+@dataclass(frozen=True)
+class OutlierThreshold:
+  bilinear: jnp.ndarray  # Shape (4, 4)
+  linear_state_ent: jnp.ndarray  # Shape (4,)
+  linear_state_std: jnp.ndarray  # Shape (4,)
+  linear_naked_ent: float
+  linear_naked_std: float
+  linear_naked_varent: float
+  bias: float
 
+  def tree_flatten(self):
+    """For JAX pytree handling"""
+    arrays = [self.bilinear, self.linear_state_ent, self.linear_state_std]
+    aux_data = {
+      "linear_naked_ent": self.linear_naked_ent,
+      "linear_naked_std": self.linear_naked_std,
+      "linear_naked_varent": self.linear_naked_varent,
+      "bias": self.bias,
+    }
+    return arrays, aux_data
 
-@jax.jit
-def dirichlet_log_likelihood_from_logprob(
-  logprobs: jnp.ndarray, alpha: jnp.ndarray
-) -> jnp.ndarray:
-  """
-  Computes Dirichlet log likelihood:
-
-  log Dir(p|α) = ln Γ(α₀) - ∑ᵢln Γ(αᵢ) + ∑ᵢ(αᵢ-1)ln(pᵢ)
-
-  where:
-  - α₀ = ∑ᵢαᵢ is the sum of all parameters
-  - Γ(x) is the gamma function
-  - pᵢ are probabilities (passed as logprobs)
-  """
-  return (
-    jnp.sum((alpha - 1.0) * logprobs, axis=-1)
-    - jsp.gammaln(jnp.sum(alpha, axis=-1))
-    + jnp.sum(jsp.gammaln(alpha), axis=-1)
-  )
-
-
-@jax.jit
-def dirichlet_expectation(alpha: jnp.ndarray) -> jnp.ndarray:
-  """
-  Computes the expectation of p ~ Dir(α):
-
-  E[p] = αᵢ/∑ⱼαⱼ
-
-  where:
-  - αᵢ is the i-th parameter
-  - ∑ⱼαⱼ is the sum of all parameters
-  """
-  alpha_sum = jnp.sum(alpha, axis=-1, keepdims=True)
-  return alpha / alpha_sum
-
-
-@jax.jit
-def dirichlet_expected_entropy(alpha: jnp.ndarray) -> jnp.ndarray:
-  """
-  Computes the expected entropy of p ~ Dir(α):
-
-  E[H(p)] = ln B(α) + (α₀ - K)ψ(α₀) - ∑ⱼ(αⱼ - 1)ψ(αⱼ)
-
-  where:
-  - B(α) is the multivariate beta function
-  - K is the dimension
-  - ψ(x) is the digamma function
-  """
-  alpha_sum = jnp.sum(alpha, axis=-1, keepdims=True)  # alpha_0
-  K = alpha.shape[-1]
-  # ln B(α) term
-  log_beta = jnp.sum(jsp.gammaln(alpha), axis=-1) - jsp.gammaln(alpha_sum.squeeze())
-
-  # (α₀ - K)ψ(α₀) term
-  digamma_sum = jsp.digamma(alpha_sum)
-  second_term = (alpha_sum.squeeze() - K) * digamma_sum.squeeze()
-
-  # -sum((αⱼ - 1)ψ(αⱼ)) term
-  digamma_alpha = jsp.digamma(alpha)
-  third_term = -jnp.sum((alpha - 1) * digamma_alpha, axis=-1)
-
-  return log_beta + second_term + third_term
-
-
-@jax.jit
-def dirichlet_expected_varentropy(alpha: jnp.ndarray) -> jnp.ndarray:
-  """Compute the expected varentropy of p ~ Dir(α):
-
-  E[∑ᵢ ln(pᵢ)² * pᵢ] = ∑ᵢ (αᵢ/α₀) * (ψ(αᵢ)² + ψ₁(αᵢ))
-
-  where:
-  - α₀ = ∑ᵢαᵢ is the sum of all parameters
-  - ψ(x) is the digamma function
-  - ψ₁(x) is the trigamma function (first derivative of digamma)
-  """
-  alpha_sum = jnp.sum(alpha, axis=-1, keepdims=True)  # α₀
-  # E[Xᵢ] = αᵢ/α₀
-  expected_x = alpha / alpha_sum
-  # ψ(αᵢ)² + ψ₁(αᵢ) term
-  digamma_alpha = jsp.digamma(alpha)
-  trigamma_alpha = jsp.polygamma(1, alpha)
-  squared_plus_deriv = digamma_alpha**2 + trigamma_alpha
-  # ∑ᵢ (αᵢ/α₀) * (ψ₁(αᵢ) + ψ(αᵢ)²)
-  return jnp.sum(expected_x * squared_plus_deriv, axis=-1)
-
-
-@jax.jit
-def halley_update(alpha, target_values):
-  """
-  Compute the Halley's method update direction for the function
-  """
-  p1 = jsp.polygamma(1, alpha)
-  p2 = jsp.polygamma(2, alpha)
-  S = jnp.sum(alpha, axis=-1, keepdims=True)
-  s1 = jsp.polygamma(1, S)
-  s2 = jsp.polygamma(2, S)
-  p1_inv = 1.0 / p1
-  sum_p1_inv = jnp.sum(p1_inv, axis=-1, keepdims=True)
-  denom = 1.0 - s1 * sum_p1_inv
-  denom = jnp.where(jnp.abs(denom) < 1e-12, 1e-12, denom)
-  coeff = s1 / denom
-  error = jsp.digamma(alpha) - jsp.digamma(S) - target_values
-  temp = p1_inv * error
-  sum_temp = jnp.sum(temp, axis=-1, keepdims=True)
-  J_inv_error = temp + coeff * sum_temp * p1_inv
-  sum_J_inv_error = jnp.sum(J_inv_error, axis=-1, keepdims=True)
-  H_J_inv_error = p2 * J_inv_error - s2 * sum_J_inv_error
-  temp2 = p1_inv * H_J_inv_error
-  sum_temp2 = jnp.sum(temp2, axis=-1, keepdims=True)
-  J_inv_H_J_inv_error = temp2 + coeff * sum_temp2 * p1_inv
-  return -J_inv_error + 0.5 * J_inv_H_J_inv_error
-
-
-@partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7, 8, 9))
-def fit_dirichlet(
-  target_values,
-  init_alpha=None,
-  initial_lr=1.2,
-  decay_alpha=0.1,
-  decay_beta=2.0,
-  decay_gamma=0.25,
-  decay_nu=0.75,
-  max_iters=140,
-  tol=1e-4,
-  dtype: jnp.dtype = jnp.bfloat16,
-):
-  """
-  Estimates Dirichlet parameters (alpha) from target logprobs.
-  """
-  batch_shape = target_values.shape[:-1]
-  n = target_values.shape[-1]
-  min_lr = 1e-8
-  target_values = target_values.astype(
-    jnp.float32
-  )  # for large vocab size needs float64
-  if init_alpha is None:
-    init_alpha = jnp.ones((*batch_shape, n), dtype=jnp.float32)
-
-  def scan_body(carry, _):
-    alpha, converged, error_norm, step = carry
-    S = jnp.sum(alpha, axis=-1, keepdims=True)
-    digamma_alpha = jsp.digamma(alpha)
-    psi_S = jsp.digamma(S)
-    error = digamma_alpha - psi_S - target_values
-    error_norm = jnp.linalg.norm(error, axis=-1)
-    new_converged = converged | (error_norm < tol)
-    exp_factor = jnp.exp(-decay_alpha * (step**decay_nu))
-    cos_factor = jnp.abs(jnp.cos(decay_beta / (step**decay_gamma)))
-    lr = initial_lr * exp_factor * cos_factor
-    lr = jnp.maximum(lr, min_lr)
-    delta_alpha = halley_update(alpha, target_values)
-    scaled_delta_alpha = lr[..., None] * delta_alpha
-    max_delta = 0.5 * alpha
-    scaled_delta_alpha = jnp.clip(scaled_delta_alpha, -max_delta, max_delta)
-    new_alpha = jnp.where(
-      new_converged[..., None],
-      alpha,
-      jnp.maximum(alpha + scaled_delta_alpha, alpha / 2),
+  @classmethod
+  def tree_unflatten(cls, aux_data, arrays):
+    """For JAX pytree handling"""
+    return cls(
+      bilinear=arrays[0],
+      linear_state_ent=arrays[1],
+      linear_state_std=arrays[2],
+      **aux_data,
     )
-    return (new_alpha, new_converged, error_norm, step + 1), None
 
-  init_state = (
-    init_alpha,
-    jnp.zeros(batch_shape, dtype=jnp.bool_),
-    jnp.full(batch_shape, jnp.inf),
-    jnp.ones(batch_shape, dtype=jnp.int32),
-  )
-  (final_alpha, final_converged, _, final_step), _ = jax.lax.scan(
-    scan_body, init_state, None, length=max_iters
-  )
-
-  return final_alpha.astype(dtype), final_step - 1, final_converged
-
-
-@jax.jit
-def ent_grad_hess(
-  logits: jnp.ndarray, T: jnp.ndarray
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-  p = jax.nn.softmax(logits / T[..., None], axis=-1)
-  log_p = jax.nn.log_softmax(logits / T[..., None], axis=-1)
-  mu1 = jnp.sum(p * log_p, axis=-1)
-  diff = log_p - mu1[..., None]
-  mu2 = jnp.sum(p * diff**2, axis=-1)
-  mu3 = jnp.sum(p * diff**3, axis=-1)
-  return -mu1, mu2 / T, -(2 * mu3 + 3 * mu2) / (T * T)
-
-
-@partial(jax.jit, static_argnums=(3, 4, 5, 6))
-def temp_tune(
-  logits: jnp.ndarray,
-  target_ent: jnp.ndarray,
-  T_init: float = 1.0,
-  lr: float = 0.1,
-  max_iters: int = 10,
-  tol: float = 1e-6,
-  dtype: jnp.dtype = jnp.bfloat16,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-  batch_size = logits.shape[0]
-  logits = logits.astype(jnp.float32)
-
-  def scan_body(carry, _):
-    T, iters, converged = carry
-    ent, grad, hess = ent_grad_hess(logits, T)
-    error = ent - target_ent
-    new_converged = converged | (jnp.abs(error) < tol)
-    denominator = 2 * grad * grad - error * hess
-    halley_step = jnp.where(
-      jnp.abs(denominator) > 1e-8,
-      2 * error * grad / denominator,
-      jnp.full_like(T, jnp.inf),
+  def __hash__(self):
+    """Static hash implementation"""
+    return hash(
+      (
+        "OutlierThreshold",
+        self.bilinear.shape,
+        str(self.bilinear.dtype),
+        self.linear_state_ent.shape,
+        str(self.linear_state_ent.dtype),
+        self.linear_state_std.shape,
+        str(self.linear_state_std.dtype),
+        self.linear_naked_ent,
+        self.linear_naked_std,
+        self.linear_naked_varent,
+        self.bias,
+      )
     )
-    newton_step = jnp.where(
-      jnp.abs(grad) > 1e-8, error / grad, jnp.full_like(T, jnp.inf)
-    )
-    grad_step = jnp.where(error > 0, lr * T, -lr * T)
 
-    delta_T = jnp.where(
-      jnp.abs(grad) < 1e-8,
-      grad_step,
-      jnp.where(jnp.abs(denominator) < 1e-8, newton_step, halley_step),
-    )
-    delta_T = jnp.clip(delta_T, -0.5 * T, 0.5 * T)
-    new_T = jnp.where(new_converged, T, jnp.maximum(T - delta_T, T / 2))
-    return (new_T, iters + 1, new_converged), None
 
-  init_state = (
-    jnp.full((batch_size,), T_init, dtype=jnp.float32),
-    jnp.zeros(batch_size, dtype=jnp.int32),
-    jnp.zeros(batch_size, dtype=jnp.bool_),
-  )
-  (final_T, final_iters, final_converged), _ = jax.lax.scan(
-    scan_body, init_state, None, length=max_iters
-  )
-  return final_T.astype(dtype), final_iters, final_converged
+@dataclass(frozen=True)
+class ArgmaxThreshold:
+  weight: float
+  bias: float
+
+  def tree_flatten(self):
+    """For JAX pytree handling"""
+    aux_data = {"weight": self.weight, "bias": self.bias}
+    return [], aux_data
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, arrays):
+    """For JAX pytree handling"""
+    return cls(**aux_data)
+
+  def __hash__(self):
+    return hash((self.weight, self.bias))
+
+
+@dataclass(frozen=True)
+class DirichletThreshold:
+  weight: float
+  bias: float
+
+  def tree_flatten(self):
+    """For JAX pytree handling"""
+    aux_data = {"weight": self.weight, "bias": self.bias}
+    return [], aux_data
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, arrays):
+    """For JAX pytree handling"""
+    return cls(**aux_data)
+
+  def __hash__(self):
+    return hash((self.weight, self.bias))
+
+
+@dataclass(frozen=True)
+class TargetEntropy:
+  linear: jnp.ndarray  # Shape (4,)
+  linear_inv_temp: jnp.ndarray  # Shape (batch_size,)
+  bias: float
+
+  def tree_flatten(self):
+    arrays = [self.linear, self.linear_inv_temp]
+    aux_data = {"bias": self.bias}
+    return arrays, aux_data
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, arrays):
+    return cls(linear=arrays[0], linear_inv_temp=arrays[1], bias=aux_data["bias"])
+
+  def __hash__(self):
+    """Static hash implementation"""
+    return hash(
+      (
+        "TargetEntropy",
+        self.linear.shape,
+        str(self.linear.dtype),
+        self.linear_inv_temp.shape,
+        str(self.linear_inv_temp.dtype),
+        self.bias,
+      )
+    )
+
+
+@dataclass(frozen=True, eq=True)
+class DSConfig:
+  # EMWA coefficients
+  emwa_logp_base: float
+  emwa_logp_exp_factor: float
+  emwa_dir_coeff: float
+  emwa_temp_coeff: float
+  emwa_dir_ent_coeff: float
+  emwa_ent_scaffold_coeff: float
+  emwa_varent_scaffold_coeff: float
+  emwa_ent_naked_coeff: float
+  emwa_varent_naked_coeff: float
+  emwa_topk_ent_naked_coeff: float
+
+  # Token cross entropy coefficients
+  token_cross_ent_scaffold_coeff: float
+  token_cross_ent_naked_coeff: float
+  token_cross_var_scaffold_coeff: float
+  token_cross_var_naked_coeff: float
+
+  # Dirichlet parameters
+  perturb_base_coeff: float
+  perturb_exp_coeff: float
+  """
+  dirichlet_support is a subset of the vocabulary of your model.
+  recommended tuning:
+  1. sample autoregressively conditioned on random hidden state prompts
+  2. take the empirical average of logprobs across position and prompts
+  3. the support is all logprobs lying above the noise threshold (see normalize_logits in dslider.py)
+  """
+  dirichlet_support: jnp.ndarray
+
+  # noise floor for logits normalization
+  noise_floor: float
+
+  # Threshold parameters
+  outlier_threshold: OutlierThreshold
+  argmax_threshold: ArgmaxThreshold
+  dirichlet_threshold: DirichletThreshold
+  target_entropy: TargetEntropy
+
+  # Token outlier
+  outlier_topk: int
+
+  def __hash__(self):
+    """Static hash implementation that avoids hashing array values"""
+    hashable_items = []
+    for field in self.__dataclass_fields__.values():
+      value = getattr(self, field.name)
+      if isinstance(value, (jnp.ndarray, jax.Array)):
+        hashable_items.append(hash((str(field.name), value.shape, str(value.dtype))))
+      elif isinstance(
+        value, (OutlierThreshold, ArgmaxThreshold, DirichletThreshold, TargetEntropy)
+      ):
+        hashable_items.append(hash(value))
+      else:
+        hashable_items.append(hash((str(field.name), value)))
+    return hash(tuple(hashable_items))
+
+  def tree_flatten(self):
+    """Improved flattening for JAX pytree"""
+    arrays = []
+    aux_data = {}
+
+    for field in self.__dataclass_fields__.values():
+      value = getattr(self, field.name)
+      if isinstance(value, (jnp.ndarray, jax.Array)):
+        arrays.append(value)
+      elif isinstance(
+        value, (OutlierThreshold, ArgmaxThreshold, DirichletThreshold, TargetEntropy)
+      ):
+        nested_arrays, nested_aux = value.tree_flatten()
+        arrays.extend(nested_arrays)
+        aux_data[field.name] = (type(value), nested_aux)
+      else:
+        aux_data[field.name] = value
+
+    return arrays, aux_data
+
+  @classmethod
+  def tree_unflatten(cls, aux_data, arrays):
+    """Improved unflattening for JAX pytree"""
+    array_idx = 0
+    field_values = {}
+
+    for field_name, field in cls.__dataclass_fields__.items():
+      if field_name in aux_data:
+        value = aux_data[field_name]
+        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], type):
+          # Reconstruct nested dataclass
+          klass, nested_aux = value
+          if klass in (OutlierThreshold, TargetEntropy):
+            n_arrays = 3 if klass == OutlierThreshold else 2
+            nested_arrays = arrays[array_idx : array_idx + n_arrays]
+            array_idx += n_arrays
+            field_values[field_name] = klass.tree_unflatten(nested_aux, nested_arrays)
+          else:
+            # For ArgmaxThreshold and DirichletThreshold which have no arrays
+            field_values[field_name] = klass(**nested_aux)
+        else:
+          field_values[field_name] = value
+      else:
+        field_values[field_name] = arrays[array_idx]
+        array_idx += 1
+
+    return cls(**field_values)
+
+
+register_pytree_node_class(DSConfig)
+register_pytree_node_class(OutlierThreshold)
+register_pytree_node_class(ArgmaxThreshold)
+register_pytree_node_class(DirichletThreshold)
+register_pytree_node_class(TargetEntropy)
+
+DEFAULT_DS_CONFIG = DSConfig(
+  emwa_logp_base=4.0,
+  emwa_logp_exp_factor=3.0,
+  emwa_dir_coeff=0.70,
+  emwa_temp_coeff=0.70,
+  emwa_dir_ent_coeff=0.70,
+  emwa_ent_scaffold_coeff=0.70,
+  emwa_varent_scaffold_coeff=0.70,
+  emwa_ent_naked_coeff=0.70,
+  emwa_varent_naked_coeff=0.70,
+  emwa_topk_ent_naked_coeff=0.70,
+  token_cross_ent_scaffold_coeff=0.65,
+  token_cross_ent_naked_coeff=0.65,
+  token_cross_var_scaffold_coeff=0.75,
+  token_cross_var_naked_coeff=0.65,
+  perturb_base_coeff=10.0,
+  perturb_exp_coeff=1.0,
+  dirichlet_support=jnp.arange(VOCAB_SIZE, dtype=jnp.int32),
+  noise_floor=-12.0,
+  outlier_threshold=OutlierThreshold(
+    bilinear=jnp.ones((4, 4)) * 1.3,
+    linear_state_ent=jnp.ones(4) * 0.80,
+    linear_state_std=jnp.ones(4) * 0.80,
+    linear_naked_ent=1.2,
+    linear_naked_std=1.2,
+    linear_naked_varent=1.2,
+    bias=0.0,
+  ),
+  argmax_threshold=ArgmaxThreshold(weight=0.1, bias=1.2),
+  dirichlet_threshold=DirichletThreshold(weight=0.1, bias=1.2),
+  target_entropy=TargetEntropy(
+    linear=jnp.array([1.0, 1.0, 1.0, 1.0]), linear_inv_temp=jnp.ones(1) * 8.0, bias=0.0
+  ),
+  outlier_topk=6,
+)
