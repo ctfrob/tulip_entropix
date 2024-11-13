@@ -2,6 +2,9 @@ from typing import Tuple, Literal, Optional
 from pathlib import Path
 import dataclasses
 
+import math
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -9,14 +12,11 @@ from jax.experimental import mesh_utils
 import tyro
 
 from entropix.config import MODEL_CONFIGS, create_model_params
-from entropix.config import LLAMA_1B_PARAMS
 from entropix.kvcache import KVCache
 from entropix.model import xfmr
 from entropix.sampler import SamplerConfig, sample
-from entropix.prompts import generate_chat_prompt
 from entropix.tokenizer import Tokenizer
 from entropix.weights import load_weights
-from entropix.dslider import initialize_state, DEFAULT_DS_CONFIG
 from MedQAPrompt_Builder import MedicalQAPrompt
 
 DEFAULT_WEIGHTS_PATH = Path(__file__).parent / '../weights'
@@ -36,7 +36,6 @@ def build_attn_mask(seqlen: int, start_pos: int) -> jax.Array:
     return mask
 
 def generate(xfmr_weights, model_params, tokens, mesh, tokenizer, xfmr_fn):
-    """Original working generation function"""
     gen_tokens = None
     cur_pos = 0
     with mesh:
@@ -65,14 +64,11 @@ def generate(xfmr_weights, model_params, tokens, mesh, tokenizer, xfmr_fn):
             kvcache, 
             attn_mask=attn_mask
         )
-        
-        # Initialize state for sampling
-        state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
-        next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+        next_token = jnp.argmax(logits[:, -1], axis=-1, keepdims=True).astype(jnp.int32)
         print(tokenizer.decode([next_token.item()]), end='', flush=True)
-        
         cur_pos = seqlen
         stop = jnp.array([128001, 128008, 128009])
+        sampler_cfg = SamplerConfig()
         gen_tokens = [next_token]
         
         while cur_pos < 8192:
@@ -85,27 +81,15 @@ def generate(xfmr_weights, model_params, tokens, mesh, tokenizer, xfmr_fn):
                 freqs_cis[cur_pos:cur_pos+1], 
                 kvcache
             )
-            next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+            next_token = sample(logits, scores, cur_pos, cfg=sampler_cfg)
             gen_tokens.append(next_token)
-            
-            try:
-                token_val = next_token.tolist()[0][0]
-                
-                # Check ALL special/stop tokens
-                if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
-                    break
-                    
-                # Only try to decode if it's not a special token
-                out_token = tokenizer.decode([token_val])
-                print(out_token, end='', flush=True)
-                
-            except Exception as e:
-                print(f"\nError in token processing: {str(e)}")
+            out_token = tokenizer.decode(next_token.tolist()[0])
+            print(out_token, end='', flush=True)
+            if jnp.isin(next_token, stop).any():
                 break
 
 @dataclasses.dataclass
 class Args:
-    """Command line arguments for the script"""
     mode: Literal["hardcoded", "medical"] = "hardcoded"
     max_questions: Optional[int] = None
     dataset: Optional[Path] = None
@@ -116,7 +100,6 @@ class Args:
             raise ValueError("Dataset path required for medical mode")
 
 def main(args: Args):
-    # Initialize model
     model_config = MODEL_CONFIGS["1B"]
     model_params = create_model_params(model_config)
     
@@ -127,15 +110,12 @@ def main(args: Args):
     sample_fn = jax.jit(sample, static_argnames=("config",))
 
     if args.mode == "hardcoded":
-        # Original hardcoded prompt
         prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
 Environment: ipython
 Cutting Knowledge Date: December 2023
 Today Date: 23 July 2024
 
-Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
-        
+Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
         print(prompt)
         tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
         generate(xfmr_weights, model_params, tokens, mesh, tokenizer, xfmr_fn)
@@ -151,7 +131,6 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|
             print("\nPress Enter to continue to next question...")
             input()
 
-# Set environment variables for XLA
 import os
 os.environ['XLA_FLAGS'] = (
     '--xla_gpu_enable_triton_softmax_fusion=true '
