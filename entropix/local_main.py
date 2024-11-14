@@ -10,11 +10,10 @@ from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 import tyro
 
-from entropix.config import MODEL_CONFIGS, create_model_params
 from entropix.config import LLAMA_1B_PARAMS
 from entropix.kvcache import KVCache
 from entropix.model import xfmr
-from entropix.sampler import sample
+from entropix.sampler import SamplerConfig, sample
 from entropix.tokenizer import Tokenizer
 from entropix.weights import load_weights
 from entropix.dslider import initialize_state
@@ -65,13 +64,12 @@ def build_attn_mask(seqlen: int, start_pos: int) -> jax.Array:
     return mask
 
 def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
+#def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instruct')):
     model_params = LLAMA_1B_PARAMS
     xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
-    # No static_argnames for sample since DSConfig contains dynamic arrays
     sample_fn = jax.jit(sample)
-
     prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 Environment: ipython
@@ -92,10 +90,9 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|
     freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
     kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
     logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-    
     # Initialize state for sampling
     state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
-    next_token, state = sample(logits[:, -1], state, DEFAULT_DS_CONFIG)
+    next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
     print(tokenizer.decode([next_token.item()]), end='', flush=True)
     
     cur_pos = seqlen
@@ -104,26 +101,22 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|
     
     while cur_pos < 8192:
         cur_pos += 1
+        
         logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+        
         next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+        
         gen_tokens.append(next_token)
         
         try:
-            print("\nRaw next_token:", next_token)
-            token_val = next_token.tolist()[0][0]
-            print(f"Extracted token_val: {token_val}")
-            
-            # Check ALL special/stop tokens
+
+            token_val = next_token.tolist()[0][0]            
             if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
-                print("\n[END TOKEN DETECTED]")
                 break
                 
-            # Only try to decode if it's not a special token
             out_token = tokenizer.decode([token_val])
             print(out_token, end='', flush=True)
-                
         except Exception as e:
-            print(f"\nError processing token: {str(e)}")
             break
 
 import os

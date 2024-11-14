@@ -32,7 +32,7 @@ class SamplerConfig:
   high_scaffold_varentropy_threshold = 0.8
 
 
-@partial(jax.jit)
+@partial(jax.jit, static_argnames=("config",))
 def sample(
   state: DSState,
   logits: jnp.ndarray,
@@ -53,7 +53,7 @@ def sample(
     scaffold_token_logprob,
   ) = adaptive_dirichlet_step(key, state, logits, config)
   new_token = new_token.reshape((bsz, 1))
-
+ 
   def _and(*args):
     res = True
     for a in args:
@@ -148,12 +148,12 @@ def sample(
       return resampled_token, jax.tree_map(lambda x: jnp.bfloat16(x[-1]), new_state)
 
     def default():
-      # jax.debug.print("Default Naked Ent: {}", naked_ent)
-      # jax.debug.print("Default Naked Varent: {}", naked_varent)
+      #jax.debug.print("Default Naked Ent: {}", naked_ent)
+      #jax.debug.print("Default Naked Varent: {}", naked_varent)
       return new_token, state
 
     return jax.lax.switch(case, (lelv, helv, lehv, hehv, default))
-
+  
   result, new_state = jax.vmap(sample_one)(
     jnp.arange(bsz),
     logits,
