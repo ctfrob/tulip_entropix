@@ -74,9 +74,9 @@ def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
 
 Environment: ipython
 Cutting Knowledge Date: December 2023
-Today Date: 23 July 2024
+Today Date: 14 November 2024
 
-Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? Double check your answer.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
     print(prompt)
@@ -101,15 +101,11 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|
     
     while cur_pos < 8192:
         cur_pos += 1
-        
         logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-        
         next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-        
         gen_tokens.append(next_token)
         
         try:
-
             token_val = next_token.tolist()[0][0]            
             if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
                 break
@@ -117,6 +113,7 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|
             out_token = tokenizer.decode([token_val])
             print(out_token, end='', flush=True)
         except Exception as e:
+            print(f"\nError in token processing: {e}")
             break
 
 import os
