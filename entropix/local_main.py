@@ -105,11 +105,25 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11?<|
     while cur_pos < 8192:
         cur_pos += 1
         logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-        next_token, state = sample(logits[:, -1], state, DEFAULT_DS_CONFIG)
+        next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
         gen_tokens.append(next_token)
-        out_token = tokenizer.decode(next_token.tolist()[0])
-        print(out_token, end='', flush=True)
-        if jnp.isin(next_token, stop).any():
+        
+        try:
+            print("\nRaw next_token:", next_token)
+            token_val = next_token.tolist()[0][0]
+            print(f"Extracted token_val: {token_val}")
+            
+            # Check ALL special/stop tokens
+            if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                print("\n[END TOKEN DETECTED]")
+                break
+                
+            # Only try to decode if it's not a special token
+            out_token = tokenizer.decode([token_val])
+            print(out_token, end='', flush=True)
+                
+        except Exception as e:
+            print(f"\nError processing token: {str(e)}")
             break
 
 import os
