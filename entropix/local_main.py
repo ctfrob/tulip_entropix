@@ -176,6 +176,17 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
             gen_tokens.append(next_token)
             
             try:
+                # Debug token decoding
+                initial_token_val = next_token.tolist()[0][0]
+                print(f"\nDEBUG: Initial token value: {initial_token_val}")
+                print(f"DEBUG: Initial token hex: {initial_token_val:x}")
+
+                # Test direct decode
+                clean_token = tokenizer.decode([initial_token_val])
+                print(f"DEBUG: Clean decoded token: {repr(clean_token)}")
+
+                # Check tokenizer properties
+                print(f"DEBUG: Tokenizer special tokens: {[t for t in [tokenizer.bos_id, tokenizer.eos_id, tokenizer.eot_id, tokenizer.eom_id] if t is not None]}")
                 token_val = next_token.tolist()[0][0]            
                 if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
                     break
