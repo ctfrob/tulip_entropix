@@ -126,6 +126,19 @@ Remember:
 - Show clear reasoning steps
 - Link to clinical significance
 - Address all major alternatives
+
+OUTPUT FORMAT
+Always structure your response exactly as follows:
+Selected Answer: [Option Letter]
+Confidence: [High/Moderate/Low]
+
+Reasoning:
+[Step by step clinical reasoning following the structure above]
+
+Alternative Discussion:
+[Brief explanation of why other options were not selected]
+
+IMPORTANT: Begin your response immediately with "Selected Answer:" followed by the option letter. Do not restate or rephrase the question.
 """
     
     def format_system_prompt(self) -> str:
@@ -157,7 +170,11 @@ Remember:
 
     def format_output(self, question: MedicalQuestion, model_output: str) -> str:
         """Format question and model output for display"""
-        return (
+        print("\nDEBUG: Starting format_output")  # Add this line
+        print(f"DEBUG: Incoming model_output length: {len(model_output)}")  # Add this line
+        print(f"DEBUG: Model output starts with: {model_output[:100]}")  # Add this line
+        print(f"DEBUG: Model output ends with: {model_output[-100:]}")  # Add this line
+        formatted = (
             "\n" + "="*80 + "\n"
             f"QUESTION TYPE: {question.meta_info}\n"
             f"QUESTION: {question.question}\n\n"
@@ -168,6 +185,8 @@ Remember:
             f"MODEL OUTPUT:\n{model_output}\n"
             "="*80 + "\n"
         )
+        print(f"DEBUG: Formatted output length: {len(formatted)}")  # Add this line
+        return formatted
 
     @staticmethod
     def parse_question_json(json_str: str) -> MedicalQuestion:
@@ -183,8 +202,15 @@ Remember:
 
     def get_prompt(self, question_json: str) -> Tuple[str, MedicalQuestion]:
         """Generate the complete formatted prompt"""
+        print("\nDEBUG: Starting get_prompt")
         question = self.parse_question_json(question_json)
-        return self.format_user_prompt(question), question
+        system_prompt = self.format_system_prompt()
+        user_prompt = self.format_user_prompt(question)
+        print(f"DEBUG: System prompt length: {len(system_prompt)}")
+        print(f"DEBUG: User prompt length: {len(user_prompt)}")
+        final_prompt = system_prompt + user_prompt
+        print(f"DEBUG: Final combined prompt length: {len(final_prompt)}")
+        return self.format_system_prompt() + self.format_user_prompt(question), question
 
     def process_jsonl_file(self, file_path: str, max_questions: Optional[int] = None) -> List[Tuple[str, MedicalQuestion]]:
         """Process multiple questions from a JSONL file"""
@@ -214,24 +240,25 @@ def main():
     prompt_handler = MedicalQAPrompt()
     
     # Example single question processing
-    example_question = {
-        "question": "A 4-year-old boy is brought to the emergency department...",
-        "answer": "Perform emergency laparotomy",
+    example_question= {
+        "question": "A 45-year-old man comes to the physician because of severe left knee pain and swelling. He has hypercholesterolemia and hypertension. Current medications include pravastatin and captopril. He eats a low-fat diet that includes fish and leafy green vegetables. He drinks 4–6 cups of coffee daily. He has smoked one pack of cigarettes daily for 26 years and drinks 2–3 beers daily. Vital signs are within normal limits. Examination of the left knee shows swelling, warmth, and severe tenderness to palpation. Arthrocentesis is performed. Gram stain is negative. Analysis of the synovial fluid shows monosodium urate crystals. Which of the following health maintenance recommendations is most appropriate to prevent symptom recurrence?", 
+        "answer": "F", 
         "options": {
-            "A": "Get consent from the patient's brother",
-            "B": "Get consent from the patient",
-            "C": "Obtain a court order for surgery",
-            "D": "Schedule hospital ethics consult",
-            "E": "Perform emergency laparotomy",
-            "F": "Delay surgery until parental consent"
-        },
+            "A": "Discontinue captopril", 
+            "B": "Start aspirin", 
+            "C": "Replace beer with red wine", 
+            "D": "Stop smoking", 
+            "E": "Reduce coffee intake", 
+            "F": "Reduce fish intake", 
+            "G": "Discontinue pravastatin", 
+            "H": "Start colchicine"
+        }, 
         "meta_info": "step2",
-        "answer_idx": "E"
+        "answer_idx": "F"
     }
-    
     prompt, question = prompt_handler.get_prompt(example_question)
     print("Generated prompt:")
-    print(prompt)
+    print(repr(prompt))
     print("\nFormatted output example:")
     print(prompt_handler.format_output(question, "Sample model output text here"))
 

@@ -20,6 +20,10 @@ from entropix.dslider import initialize_state
 from entropix.dslider_config import DEFAULT_DS_CONFIG
 from MedQAPrompt_Builder import MedicalQAPrompt
 
+import logging
+
+logging.basicConfig(filename='medqa_debug.log', level=logging.DEBUG)
+
 DEFAULT_WEIGHTS_PATH = Path(__file__).parent / '../weights'
 
 def apply_scaling(freqs: jax.Array):
@@ -63,14 +67,21 @@ def build_attn_mask(seqlen: int, start_pos: int) -> jax.Array:
         mask = jnp.hstack([jnp.zeros((seqlen, start_pos)), mask], dtype=jnp.float32)
     return mask
 
-def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct')):
+def main(
+        weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct'),
+        mode: Literal["sort", "medqa_example", "benchmark"] = "sort",
+        max_questions: Optional[int] = None,
+        dataset_path: Path = Path("entropix/data/US_qbank.jsonl")
+    ):
 #def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instruct')):
     model_params = LLAMA_1B_PARAMS
     xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     sample_fn = jax.jit(sample)
-    prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+    if mode == "sort":
+        prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 Environment: ipython
 Cutting Knowledge Date: December 2023
@@ -79,42 +90,158 @@ Today Date: 14 November 2024
 Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? Double check your answer.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
-    print(prompt)
-    tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
-    
-    # Generation loop moved into main
-    cur_pos = 0
-    tokens = jnp.array([tokens], jnp.int32)
-    bsz, seqlen = tokens.shape
-    attn_mask = build_attn_mask(seqlen, cur_pos)
-    freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
-    kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
-    logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-    # Initialize state for sampling
-    state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
-    next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-    print(tokenizer.decode([next_token.item()]), end='', flush=True)
-    
-    cur_pos = seqlen
-    stop = jnp.array([128001, 128008, 128009])
-    gen_tokens = [next_token]
-    
-    while cur_pos < 8192:
-        cur_pos += 1
-        logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+        print(prompt)
+        tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
+        # Generation loop moved into main
+        cur_pos = 0
+        tokens = jnp.array([tokens], jnp.int32)
+        bsz, seqlen = tokens.shape
+        attn_mask = build_attn_mask(seqlen, cur_pos)
+        freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
+        kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
+        logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
+        # Initialize state for sampling
+        state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
         next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-        gen_tokens.append(next_token)
+        print(tokenizer.decode([next_token.item()]), end='', flush=True)
         
-        try:
-            token_val = next_token.tolist()[0][0]            
-            if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+        cur_pos = seqlen
+        stop = jnp.array([128001, 128008, 128009])
+        gen_tokens = [next_token]
+        
+        while cur_pos < 8192:
+            cur_pos += 1
+            logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+            next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+            gen_tokens.append(next_token)
+            
+            try:
+                token_val = next_token.tolist()[0][0]            
+                if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                    break
+                    
+                out_token = tokenizer.decode([token_val])
+                print(out_token, end='', flush=True)
+            except Exception as e:
+                print(f"\nError in token processing: {e}")
                 break
+
+    elif mode == "medqa_example":
+        print("\nStarting MedQA example...")
+        prompt_handler = MedicalQAPrompt()
+        example_question= {
+            "question": "A 45-year-old man comes to the physician because of severe left knee pain and swelling. He has hypercholesterolemia and hypertension. Current medications include pravastatin and captopril. He eats a low-fat diet that includes fish and leafy green vegetables. He drinks 4–6 cups of coffee daily. He has smoked one pack of cigarettes daily for 26 years and drinks 2–3 beers daily. Vital signs are within normal limits. Examination of the left knee shows swelling, warmth, and severe tenderness to palpation. Arthrocentesis is performed. Gram stain is negative. Analysis of the synovial fluid shows monosodium urate crystals. Which of the following health maintenance recommendations is most appropriate to prevent symptom recurrence?", 
+            "answer": "F", 
+            "options": {
+                "A": "Discontinue captopril", 
+                "B": "Start aspirin", 
+                "C": "Replace beer with red wine", 
+                "D": "Stop smoking", 
+                "E": "Reduce coffee intake", 
+                "F": "Reduce fish intake", 
+                "G": "Discontinue pravastatin", 
+                "H": "Start colchicine"
+            }, 
+            "meta_info": "step2",
+            "answer_idx": "F"
+        }
+        prompt, question = prompt_handler.get_prompt(example_question)
+        print("\nEncoding prompt...")
+        tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
+        print(f"Token shape: {jnp.array([tokens], jnp.int32).shape}")
+        
+        # Generation loop moved into main
+        cur_pos = 0
+        tokens = jnp.array([tokens], jnp.int32)
+        bsz, seqlen = tokens.shape
+        attn_mask = build_attn_mask(seqlen, cur_pos)
+        freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
+        kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
+        logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
+        # Initialize state for sampling
+        state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
+        next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+        generated_text = tokenizer.decode([next_token.item()])
+        print(f"\nInitial token: {generated_text}")
+        print(generated_text, end='', flush=True)
+        
+        cur_pos = seqlen
+        stop = jnp.array([128001, 128008, 128009])
+        gen_tokens = [next_token]
+        
+        while cur_pos < 8192:
+            cur_pos += 1
+            
+            logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+            
+            next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+            
+            gen_tokens.append(next_token)
+            
+            try:
+                token_val = next_token.tolist()[0][0]            
+                if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                    logging.debug(f"Hit stop token {token_val} at position {cur_pos}")
+                    logging.debug(f"Current generated_text length: {len(generated_text)}")
+                    break
+                    
+                out_token = tokenizer.decode([token_val])
+                generated_text += out_token
+                print(out_token, end='', flush=True)
+            except Exception as e:
+                print(f"\nError in token processing: {e}")
+                break
+        
+        #print(prompt_handler.format_output(question, generated_text))
+
+    else:  # mode == "benchmark"
+        prompt_handler = MedicalQAPrompt()
+        prompts = prompt_handler.process_jsonl_file(str(dataset_path), max_questions)
+        
+        for prompt, question in prompts:
+            print(prompt)
+            tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
+            
+            # Generation loop moved into main
+            cur_pos = 0
+            tokens = jnp.array([tokens], jnp.int32)
+            bsz, seqlen = tokens.shape
+            attn_mask = build_attn_mask(seqlen, cur_pos)
+            freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
+            kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
+            logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
+            # Initialize state for sampling
+            state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
+            next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+            generated_text = tokenizer.decode([next_token.item()])
+            print(generated_text, end='', flush=True)
+            
+            cur_pos = seqlen
+            stop = jnp.array([128001, 128008, 128009])
+            gen_tokens = [next_token]
+            
+            while cur_pos < 8192:
+                cur_pos += 1
                 
-            out_token = tokenizer.decode([token_val])
-            print(out_token, end='', flush=True)
-        except Exception as e:
-            print(f"\nError in token processing: {e}")
-            break
+                logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+                
+                next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+                
+                gen_tokens.append(next_token)
+                
+                try:
+                    token_val = next_token.tolist()[0][0]            
+                    if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                        break
+                        
+                    out_token = tokenizer.decode([token_val])
+                    generated_text += out_token
+                    print(out_token, end='', flush=True)
+                except Exception as e:
+                    break
+            
+            print("\n" + "="*80)
+            print(prompt_handler.format_output(question, generated_text))
 
 import os
 os.environ['XLA_FLAGS'] = (
