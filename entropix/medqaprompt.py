@@ -170,22 +170,44 @@ IMPORTANT: Begin your response immediately with "Selected Answer:" followed by t
 
     def format_output(self, question: MedicalQuestion, model_output: str) -> str:
         """Format question and model output for display"""
-        print("\nDEBUG: Starting format_output")  # Add this line
-        print(f"DEBUG: Incoming model_output length: {len(model_output)}")  # Add this line
-        print(f"DEBUG: Model output starts with: {model_output[:100]}")  # Add this line
-        print(f"DEBUG: Model output ends with: {model_output[-100:]}")  # Add this line
-        formatted = (
-            "\n" + "="*80 + "\n"
-            f"QUESTION TYPE: {question.meta_info}\n"
-            f"QUESTION: {question.question}\n\n"
-            "OPTIONS:\n" + 
-            "\n".join([f"{key}: {value}" for key, value in sorted(question.options.items())]) + 
-            "\n\n"
-            f"CORRECT ANSWER: {question.answer} ({question.answer_idx})\n\n"
-            f"MODEL OUTPUT:\n{model_output}\n"
-            "="*80 + "\n"
-        )
-        print(f"DEBUG: Formatted output length: {len(formatted)}")  # Add this line
+    
+        clean_output = model_output
+        if "<|begin_of_text|>" in clean_output:
+            clean_output = clean_output.split("Answer:")[-1].strip()
+
+        # Create the formatted string piece by piece
+        header = "\n" + "="*80 + "\n"
+        question_type = f"QUESTION TYPE: {question.meta_info}\n"
+        question_text = f"QUESTION: {question.question}\n\n"
+        options_text = "OPTIONS:\n" + "\n".join([f"{key}: {value}" for key, value in sorted(question.options.items())]) + "\n\n"
+        answer_text = f"CORRECT ANSWER: {question.answer} ({question.answer_idx})\n\n"
+        model_text = f"MODEL OUTPUT:\n{clean_output}\n"
+        footer = "="*80 + "\n"
+        
+        # Debug each component length
+        print("\nDEBUG: Component lengths:")
+        print(f"Header: {len(header)}")
+        print(f"Question type: {len(question_type)}")
+        print(f"Question: {len(question_text)}")
+        print(f"Options: {len(options_text)}")
+        print(f"Answer: {len(answer_text)}")
+        print(f"Model output: {len(model_text)}")
+        print(f"Footer: {len(footer)}")
+        formatted = header + question_type + question_text + options_text + answer_text + model_text + footer
+        print(f"\nDEBUG: Final length: {len(formatted)}")
+           
+        #formatted = (
+         #   "\n" + "="*80 + "\n"
+          #  f"QUESTION TYPE: {question.meta_info}\n"
+           # f"QUESTION: {question.question}\n\n"
+            #"OPTIONS:\n" + 
+            #"\n".join([f"{key}: {value}" for key, value in sorted(question.options.items())]) + 
+            #"\n\n"
+            #f"CORRECT ANSWER: {question.answer} ({question.answer_idx})\n\n"
+            #f"MODEL OUTPUT:\n{model_output}\n"
+            #"="*80 + "\n"
+        #)
+        #print(f"DEBUG: Formatted output length: {len(formatted)}")
         return formatted
 
     @staticmethod
@@ -202,14 +224,10 @@ IMPORTANT: Begin your response immediately with "Selected Answer:" followed by t
 
     def get_prompt(self, question_json: str) -> Tuple[str, MedicalQuestion]:
         """Generate the complete formatted prompt"""
-        print("\nDEBUG: Starting get_prompt")
         question = self.parse_question_json(question_json)
         system_prompt = self.format_system_prompt()
         user_prompt = self.format_user_prompt(question)
-        print(f"DEBUG: System prompt length: {len(system_prompt)}")
-        print(f"DEBUG: User prompt length: {len(user_prompt)}")
         final_prompt = system_prompt + user_prompt
-        print(f"DEBUG: Final combined prompt length: {len(final_prompt)}")
         return self.format_system_prompt() + self.format_user_prompt(question), question
 
     def process_jsonl_file(self, file_path: str, max_questions: Optional[int] = None) -> List[Tuple[str, MedicalQuestion]]:
@@ -257,9 +275,7 @@ def main():
         "answer_idx": "F"
     }
     prompt, question = prompt_handler.get_prompt(example_question)
-    print("Generated prompt:")
     print(repr(prompt))
-    print("\nFormatted output example:")
     print(prompt_handler.format_output(question, "Sample model output text here"))
 
 if __name__ == "__main__":

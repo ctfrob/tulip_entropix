@@ -1,4 +1,5 @@
 from typing import Tuple, Literal, Optional
+import time
 
 import math
 from pathlib import Path
@@ -18,7 +19,7 @@ from entropix.tokenizer import Tokenizer
 from entropix.weights import load_weights
 from entropix.dslider import initialize_state
 from entropix.dslider_config import DEFAULT_DS_CONFIG
-from MedQAPrompt_Builder import MedicalQAPrompt
+from entropix.medqaprompt import MedicalQAPrompt
 
 import logging
 
@@ -146,7 +147,6 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
             "answer_idx": "F"
         }
         prompt, question = prompt_handler.get_prompt(example_question)
-        print("\nEncoding prompt...")
         tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
         print(f"Token shape: {jnp.array([tokens], jnp.int32).shape}")
         
@@ -171,28 +171,31 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
         
         while cur_pos < 8192:
             cur_pos += 1
-            
             logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-            
             next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-            
             gen_tokens.append(next_token)
             
             try:
                 token_val = next_token.tolist()[0][0]            
                 if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
-                    logging.debug(f"Hit stop token {token_val} at position {cur_pos}")
-                    logging.debug(f"Current generated_text length: {len(generated_text)}")
                     break
                     
                 out_token = tokenizer.decode([token_val])
                 generated_text += out_token
-                print(out_token, end='', flush=True)
             except Exception as e:
                 print(f"\nError in token processing: {e}")
                 break
-        
+        print ("\nComplete generated text:", generated_text)
+        time.sleep(1)
         #print(prompt_handler.format_output(question, generated_text))
+        if "<|begin_of_text|>" in generated_text:
+            generated_text = generated_text.split("Answer:")[1].strip()
+
+        with open('debug_output.txt', 'w') as f:
+          f.write(f"Generated text length: {len(generated_text)}\n")
+          f.write(f"Generated text:\n{generated_text}\n")
+          f.write("\nFormatted output:\n")
+          f.write(prompt_handler.format_output(question, generated_text))
 
     else:  # mode == "benchmark"
         prompt_handler = MedicalQAPrompt()
