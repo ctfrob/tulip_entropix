@@ -10,7 +10,6 @@ class MedicalQuestion:
     answer: str  # Text form of answer
     options: Dict[str, str]
     meta_info: str
-    answer_idx: str  # Letter index (A, B, C, etc.)
 
 class MedicalQAPrompt:
     """
@@ -180,7 +179,7 @@ IMPORTANT: Begin your response immediately with "Selected Answer:" followed by t
         question_type = f"QUESTION TYPE: {question.meta_info}\n"
         question_text = f"QUESTION: {question.question}\n\n"
         options_text = "OPTIONS:\n" + "\n".join([f"{key}: {value}" for key, value in sorted(question.options.items())]) + "\n\n"
-        answer_text = f"CORRECT ANSWER: {question.answer} ({question.answer_idx})\n\n"
+        answer_text = f"CORRECT ANSWER: {question.answer}\n\n"
         model_text = f"MODEL OUTPUT:\n{clean_output}\n"
         footer = "="*80 + "\n"
         
@@ -203,7 +202,7 @@ IMPORTANT: Begin your response immediately with "Selected Answer:" followed by t
             #"OPTIONS:\n" + 
             #"\n".join([f"{key}: {value}" for key, value in sorted(question.options.items())]) + 
             #"\n\n"
-            #f"CORRECT ANSWER: {question.answer} ({question.answer_idx})\n\n"
+            #f"CORRECT ANSWER: {question.answer}\n\n"
             #f"MODEL OUTPUT:\n{model_output}\n"
             #"="*80 + "\n"
         #)
@@ -218,8 +217,7 @@ IMPORTANT: Begin your response immediately with "Selected Answer:" followed by t
             question=data["question"],
             answer=data["answer"],
             options=data["options"],
-            meta_info=data["meta_info"],
-            answer_idx=data["answer_idx"]
+            meta_info=data["meta_info"]
         )
 
     def get_prompt(self, question_json: str) -> Tuple[str, MedicalQuestion]:
@@ -272,7 +270,6 @@ def main():
             "H": "Start colchicine"
         }, 
         "meta_info": "step2",
-        "answer_idx": "F"
     }
     prompt, question = prompt_handler.get_prompt(example_question)
     print(repr(prompt))
