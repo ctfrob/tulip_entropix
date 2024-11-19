@@ -127,15 +127,10 @@ Remember:
 - Address all major alternatives
 
 OUTPUT FORMAT
-Always structure your response exactly as follows:
+Always structure your response exactly as follows and in as concise a manner as possible:
 Selected Answer: [Option Letter]
 Confidence: [High/Moderate/Low]
-
-Reasoning:
-[Step by step clinical reasoning following the structure above]
-
-Alternative Discussion:
-[Brief explanation of why other options were not selected]
+Reasoning:[Single concise reason supporting selection]
 
 IMPORTANT: Begin your response immediately with "Selected Answer:" followed by the option letter. Do not restate or rephrase the question.
 """
@@ -227,7 +222,23 @@ IMPORTANT: Begin your response immediately with "Selected Answer:" followed by t
         user_prompt = self.format_user_prompt(question)
         final_prompt = system_prompt + user_prompt
         return self.format_system_prompt() + self.format_user_prompt(question), question
-
+    
+    def update_prompt_with_context(self, original_prompt: str, retrieved_contexts: list[dict]) -> str:
+        """Insert retrieved context between system prompt and question"""
+        # Split at the user section
+        system_part, user_part = original_prompt.split("<|start_header_id|>user<|end_header_id|>")
+        
+        # Format retrieved contexts
+        context_section = "\nRELEVANT CONTEXT:\n"
+        for ctx in retrieved_contexts:
+            context_section += f"[Score: {ctx['score']:.2f}] From {ctx['source']}:\n{ctx['text']}\n\n"
+            
+        # Reassemble with context
+        return (f"{system_part}"
+                f"<|start_header_id|>user<|end_header_id|>\n"
+                f"{context_section}"
+                f"{user_part}")
+    
     def process_jsonl_file(self, file_path: str, max_questions: Optional[int] = None) -> List[Tuple[str, MedicalQuestion]]:
         """Process multiple questions from a JSONL file"""
         prompts = []

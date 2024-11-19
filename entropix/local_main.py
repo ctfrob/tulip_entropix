@@ -20,6 +20,7 @@ from entropix.weights import load_weights
 from entropix.dslider import initialize_state
 from entropix.dslider_config import DEFAULT_DS_CONFIG
 from entropix.medqaprompt import MedicalQAPrompt
+from vectordb.retrieval_system import MedicalRetrievalSystem
 
 import logging
 
@@ -80,6 +81,7 @@ def main(
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     sample_fn = jax.jit(sample)
+    retrieval_system = MedicalRetrievalSystem()
 
     if mode == "sort":
         prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
@@ -146,7 +148,10 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
             "meta_info": "step2",
             "answer_idx": "F"
         }
+        retrieved_context = retrieval_system.retrieve_context(example_question["question"])
         prompt, question = prompt_handler.get_prompt(example_question)
+        prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
+
         tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
         print(f"Token shape: {jnp.array([tokens], jnp.int32).shape}")
         
@@ -210,13 +215,19 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
 
     else:  # mode == "benchmark"
         prompt_handler = MedicalQAPrompt()
+        retrieved_contexts = retrieval_system.retrieve(question["question"])
+        prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_contexts)
         prompts = prompt_handler.process_jsonl_file(str(dataset_path), max_questions)
-        
+
+        print(f"\nProcessing {len(prompts)} questions with retrieval augmentation...")
+
         for prompt, question in prompts:
+            retrieved_context = retrieval_system.retrieve_context(question["question"])
+            prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
+
             print(prompt)
             tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
             
-            # Generation loop moved into main
             cur_pos = 0
             tokens = jnp.array([tokens], jnp.int32)
             bsz, seqlen = tokens.shape
