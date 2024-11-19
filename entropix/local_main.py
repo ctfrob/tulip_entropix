@@ -20,7 +20,7 @@ from entropix.weights import load_weights
 from entropix.dslider import initialize_state
 from entropix.dslider_config import DEFAULT_DS_CONFIG
 from entropix.medqaprompt import MedicalQAPrompt
-from vectordb.retrieval_system import MedicalRetrievalSystem
+from vectordb.retrieval_system import RetrievalSystem
 
 import logging
 
@@ -81,7 +81,7 @@ def main(
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     sample_fn = jax.jit(sample)
-    retrieval_system = MedicalRetrievalSystem()
+    retrieval_system = RetrievalSystem()
 
     if mode == "sort":
         prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
