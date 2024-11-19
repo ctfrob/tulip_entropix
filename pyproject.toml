@@ -27,8 +27,6 @@ huggingface-hub = {extras = ["cli"], version = "^0.25.1"}
 torch = "^2.4.1"
 fairscale = "^0.4.13"
 
-
-
 [tool.poetry.group.eval.dependencies]
 lm-eval = "^0.4.4"
 langdetect = "^1.0.9"
@@ -38,15 +36,19 @@ requests = "^2.32.3"
 pandas = "^2.2.3"
 blobfile = "^3.0.0"
 
-
+[tool.poetry.group.embeddings.dependencies]
+transformers = "^4.45.1"
+torch = "^2.0.0"
+qdrant-client = "^1.7.0"
+python-dotenv = "^1.0.0"
+tqdm = "^4.66.0"
+einops = "^0.7.0"
 
 [tool.poetry.group.server.dependencies]
 fastapi = "^0.115.3"
 pydantic = "^2.9.2"
 uvicorn = "^0.32.0"
 openai = "^1.52.2"
-
-
 
 [build-system]
 requires = ["poetry-core"]
