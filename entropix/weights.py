@@ -76,7 +76,7 @@ def load_weights(
   w = {}
   layer_weights = []
 
-  for file in ckpt_dir.glob("*.npy"):
+  for file in sorted(ckpt_dir.glob("*.npy")):
     name = ".".join(str(file).split("/")[-1].split(".")[:-1])
     weight = jnp.load(file=file, mmap_mode="r", allow_pickle=True)
     partition_spec = create_partition_spec(name)
@@ -93,6 +93,7 @@ def load_weights(
     w[name] = jax.device_put(weight)
 
   for i in range(model_params.n_layers):
+    print(f"Attempting to load: {f'layers.{i}.attention.wq.weight'}")
     layer_weights.append(
       LayerWeights(
         wq=w[f"layers.{i}.attention.wq.weight"],

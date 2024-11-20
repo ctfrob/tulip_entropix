@@ -11,7 +11,7 @@ from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 import tyro
 
-from entropix.config import LLAMA_1B_PARAMS
+from entropix.config import LLAMA_1B_PARAMS, LLAMA_70B_PARAMS
 from entropix.kvcache import KVCache
 from entropix.model import xfmr
 from entropix.sampler import SamplerConfig, sample
@@ -70,14 +70,15 @@ def build_attn_mask(seqlen: int, start_pos: int) -> jax.Array:
     return mask
 
 def main(
-        weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('1B-Instruct'),
+        weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Instruct'), #'1B-Instruct' or '70B-Instruct'
         mode: Literal["sort", "medqa_example", "benchmark"] = "sort",
         max_questions: Optional[int] = None,
         dataset_path: Path = Path("entropix/data/US_qbank.jsonl")
     ):
-#def main(weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Nemotron-Instruct')):
-    model_params = LLAMA_1B_PARAMS
+    model_params = LLAMA_70B_PARAMS # LLAMA_70B_PARAMS or LLAMA_1B_PARAMS
+    print(f"Loading weights from: {weights_path.absolute()}")
     xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
+    print(f"Files in directory: {list(weights_path.glob('*.npy'))}")
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     sample_fn = jax.jit(sample)
