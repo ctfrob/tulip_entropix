@@ -38,7 +38,7 @@ blobfile = "^3.0.0"
 
 [tool.poetry.group.embeddings.dependencies]
 transformers = "^4.45.1"
-torch = "^2.0.0"
+torch = {version = "^2.0.0", extras = ["cuda12"]}
 qdrant-client = "^1.7.0"
 python-dotenv = "^1.0.0"
 tqdm = "^4.66.0"

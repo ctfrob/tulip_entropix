@@ -148,7 +148,7 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
             "meta_info": "step2",
             "answer_idx": "F"
         }
-        retrieved_context = retrieval_system.retrieve_context(example_question["question"])
+        retrieved_context = retrieval_system.retrieve(example_question["question"])
         prompt, question = prompt_handler.get_prompt(example_question)
         prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
 
@@ -181,29 +181,18 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
             gen_tokens.append(next_token)
             
             try:
-                # Debug token decoding
-                initial_token_val = next_token.tolist()[0][0]
-                print(f"\nDEBUG: Initial token value: {initial_token_val}")
-                print(f"DEBUG: Initial token hex: {initial_token_val:x}")
-
-                # Test direct decode
-                clean_token = tokenizer.decode([initial_token_val])
-                print(f"DEBUG: Clean decoded token: {repr(clean_token)}")
-
-                # Check tokenizer properties
-                print(f"DEBUG: Tokenizer special tokens: {[t for t in [tokenizer.bos_id, tokenizer.eos_id, tokenizer.eot_id, tokenizer.eom_id] if t is not None]}")
                 token_val = next_token.tolist()[0][0]            
                 if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
                     break
                     
                 out_token = tokenizer.decode([token_val])
-                generated_text += out_token
+                print(out_token, end='', flush=True)
             except Exception as e:
                 print(f"\nError in token processing: {e}")
                 break
-        print ("\nComplete generated text:", generated_text)
+
         time.sleep(1)
-        #print(prompt_handler.format_output(question, generated_text))
+
         if "<|begin_of_text|>" in generated_text:
             generated_text = generated_text.split("Answer:")[1].strip()
 
@@ -215,18 +204,17 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
 
     else:  # mode == "benchmark"
         prompt_handler = MedicalQAPrompt()
-        retrieved_contexts = retrieval_system.retrieve(question["question"])
-        prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_contexts)
+
         prompts = prompt_handler.process_jsonl_file(str(dataset_path), max_questions)
 
         print(f"\nProcessing {len(prompts)} questions with retrieval augmentation...")
 
         for prompt, question in prompts:
-            retrieved_context = retrieval_system.retrieve_context(question["question"])
-            prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
+            retrieved_context = retrieval_system.retrieve(question.question)
+            augmented_prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
 
-            print(prompt)
-            tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
+            print(augmented_prompt)
+            tokens = tokenizer.encode(augmented_prompt, bos=False, eos=False, allowed_special='all')
             
             cur_pos = 0
             tokens = jnp.array([tokens], jnp.int32)
