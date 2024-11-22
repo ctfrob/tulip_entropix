@@ -1,6 +1,8 @@
 import os
 from logging import getLogger
 from pathlib import Path
+from transformers import AutoTokenizer
+import torch
 from typing import (
   AbstractSet,
   cast,
@@ -14,12 +16,7 @@ from typing import (
   Union,
 )
 
-import tiktoken
-
-from tiktoken.load import load_tiktoken_bpe
-
 logger = getLogger(__name__)
-
 
 # The tiktoken tokenizer can handle <=400k chars without
 # pyo3_runtime.PanicException.
@@ -30,187 +27,85 @@ TIKTOKEN_MAX_ENCODE_CHARS = 400_000
 # of max consecutive non-whitespace or whitespace characters.
 MAX_NO_WHITESPACES_CHARS = 25_000
 
-
 class Tokenizer:
-  """
-  Tokenizing and encoding/decoding text using the Tiktoken tokenizer.
-  """
-
-  special_tokens: Dict[str, int]
-
-  num_reserved_special_tokens = 256
-
-  pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
-
-  def __init__(self, model_path: str):
-    """
-    Initializes the Tokenizer with a Tiktoken model.
-
-    Args:
-        model_path (str): The path to the Tiktoken model file.
-    """
-    assert os.path.isfile(model_path), model_path
-
-    mergeable_ranks = load_tiktoken_bpe(model_path)
-    num_base_tokens = len(mergeable_ranks)
-    
-    # Initialize with LLaMA special tokens
-    self.special_tokens = {
-        '<|begin_of_text|>': 128000,  # BOS
-        '<|end_of_text|>': 128001,    # EOS
-        '<|im_start|>': 128006,       # Chat start
-        '<|im_end|>': 128007,         # Chat end
-        '<|assistant|>': 128008,      # Assistant marker
-        '<|user|>': 128009,           # User marker
-        '<|finetune_right_pad_id|>': 128002,
-        '<|step_id|>': 128003,
-        '<|start_header_id|>': 128004,
-        '<|end_header_id|>': 128005,
-        '<|eom_id|>': 128007,         # Using im_end as eom
-        '<|eot_id|>': 128001,         # Using eos as eot
-        '<|python_tag|>': 128010,
-    }
-
-    # Add reserved tokens if needed (but we probably don't need them for LLaMA)
-    # for i in range(self.num_reserved_special_tokens - len(self.special_tokens)):
-    #     token = f'<|reserved_special_token_{i + len(self.special_tokens)}|>'
-    #     self.special_tokens[token] = 128011 + i  # Continue from where we left off
-
-    self.model = tiktoken.Encoding(
-        name=Path(model_path).name,
-        pat_str=self.pat_str,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=self.special_tokens,
-    )
-
-    self.n_words: int = 128256  # LLaMA's vocab size
-    
-    # Set token IDs directly from the dictionary
-    self.bos_id: int = self.special_tokens['<|begin_of_text|>']
-    self.eos_id: int = self.special_tokens['<|end_of_text|>']
-    self.eot_id: int = self.special_tokens['<|eot_id|>']
-    self.eom_id: int = self.special_tokens['<|eom_id|>']
-    self.python_tag_id = self.special_tokens['<|python_tag|>']
-    self.pad_id: int = self.special_tokens['<|finetune_right_pad_id|>']
-    
-    # Set stop tokens
-    self.stop_tokens = [
-        self.special_tokens['<|eom_id|>'],    # 128007
-        self.special_tokens['<|eot_id|>'],    # 128001
-        self.special_tokens['<|im_end|>'],    # 128007
-        self.special_tokens['<|assistant|>'],  # 128008
-        self.special_tokens['<|user|>'],      # 128009
-    ]
-
-  def encode(
-    self,
-    s: str,
-    *,
-    bos: bool,
-    eos: bool,
-    allowed_special: Optional[Union[Literal['all'], AbstractSet[str]]] = None,
-    disallowed_special: Union[Literal['all'], Collection[str]] = (),
-  ) -> List[int]:
-    """
-    Encodes a string into a list of token IDs.
-
-    Args:
-        s (str): The input string to be encoded.
-        bos (bool): Whether to prepend the beginning-of-sequence token.
-        eos (bool): Whether to append the end-of-sequence token.
-        allowed_tokens ("all"|set[str]): allowed special tokens in string
-        disallowed_tokens ("all"|set[str]): special tokens that raise an error when in string
-
-    Returns:
-        list[int]: A list of token IDs.
-
-    By default, setting disallowed_special=() encodes a string by ignoring
-    special tokens. Specifically:
-    - Setting `disallowed_special` to () will cause all text corresponding
-      to special tokens to be encoded as natural text (insteading of raising
-      an error).
-    - Setting `allowed_special` to "all" will treat all text corresponding
-      to special tokens to be encoded as special tokens.
-    """
-    if allowed_special is None:
-      allowed_special = set()
-    assert isinstance(s, str)
-
-    substrs = (
-      substr
-      for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
-      for substr in self._split_whitespaces_or_nonwhitespaces(
-        s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
-      )
-    )
-    t: List[int] = []
-    for substr in substrs:
-      t.extend(
-        self.model.encode(
-          substr,
-          allowed_special=allowed_special,
-          disallowed_special=disallowed_special,
-        )
-      )
-    if bos:
-      t.insert(0, self.bos_id)
-    if eos:
-      t.append(self.eos_id)
-    return t
-
-  def decode(self, t: Sequence[int]) -> str:
-    """
-    Decodes a list of token IDs into a string.
-
-    Args:
-        t (List[int]): The list of token IDs to be decoded.
-
-    Returns:
-        str: The decoded string.
-    """
-    try:
-        # First check if it's a special token or high-value token
-        if len(t) == 1:
-            token_val = t[0]
-            # Handle special tokens
-            if token_val >= 128000:
-                logger.debug(f"Special token encountered: {token_val}")
-                return ""
-            # Handle high-value tokens that might be beyond mergeable_ranks
-            if token_val >= 100000:
-                logger.debug(f"High-value token encountered: {token_val}")
-                return f"<|token_{token_val}|>"
-                
-        # For normal tokens, use the base tokenizer
-        return self.model.decode(cast(List[int], t))
+    def __init__(self, model_path: str):
+        """Initialize tokenizer from saved model path"""
+        self.model = AutoTokenizer.from_pretrained(model_path)
         
-    except Exception as e:
-        logger.warning(f"Failed to decode token {t}: {e}")
-        token_val = t[0] if len(t) == 1 else None
-        if token_val is not None:
-            return f"<|token_{token_val}|>"
-        return ""
+        # LLaMA special tokens mapping
+        self.special_tokens = {
+            'bos_token': '<s>',
+            'eos_token': '</s>',
+            'pad_token': '<pad>',
+            'unk_token': '<unk>',
+            'im_start': '<|im_start|>',
+            'im_end': '<|im_end|>',
+            'assistant': '<|assistant|>',
+            'user': '<|user|>',
+            'python': '<|python_tag|>'
+        }
+        
+        # Add special tokens if not present
+        self.model.add_special_tokens({'additional_special_tokens': list(self.special_tokens.values())})
+        
+        # Set token IDs
+        self.bos_id = self.model.bos_token_id
+        self.eos_id = self.model.eos_token_id
+        self.pad_id = self.model.pad_token_id
+        self.eot_id = self.eos_id  # Using EOS as EOT
+        self.eom_id = self.model.convert_tokens_to_ids(self.special_tokens['im_end'])
+        self.python_tag_id = self.model.convert_tokens_to_ids(self.special_tokens['python'])
+        
+        # Stop tokens
+        self.stop_tokens = [
+            self.eom_id,
+            self.eot_id,
+            self.model.convert_tokens_to_ids(self.special_tokens['im_end']),
+            self.model.convert_tokens_to_ids(self.special_tokens['assistant']),
+            self.model.convert_tokens_to_ids(self.special_tokens['user'])
+        ]
+        
+        self.n_words = len(self.model.get_vocab())
 
-  @staticmethod
-  def _split_whitespaces_or_nonwhitespaces(s: str, max_consecutive_slice_len: int) -> Iterator[str]:
-    """
-    Splits the string `s` so that each substring contains no more than `max_consecutive_slice_len`
-    consecutive whitespaces or consecutive non-whitespaces.
-    """
-    current_slice_len = 0
-    current_slice_is_space = s[0].isspace() if len(s) > 0 else False
-    slice_start = 0
+    def encode(
+        self,
+        text: str,
+        bos: bool = False,
+        eos: bool = False,
+        **kwargs
+    ) -> List[int]:
+        """Encode text to token ids"""
+        tokens = self.model.encode(
+            text,
+            add_special_tokens=False,
+            **kwargs
+        )
+        
+        if bos:
+            tokens.insert(0, self.bos_id)
+        if eos:
+            tokens.append(self.eos_id)
+            
+        return tokens
 
-    for i in range(len(s)):
-      is_now_space = s[i].isspace()
+    def decode(self, token_ids: Sequence[int]) -> str:
+        """Decode token ids to text"""
+        text = self.model.decode(token_ids, skip_special_tokens=False)
+        return text
 
-      if current_slice_is_space ^ is_now_space:
-        current_slice_len = 1
-        current_slice_is_space = is_now_space
-      else:
-        current_slice_len += 1
-        if current_slice_len > max_consecutive_slice_len:
-          yield s[slice_start:i]
-          slice_start = i
-          current_slice_len = 1
-    yield s[slice_start:]
+    def batch_encode(
+        self,
+        texts: List[str],
+        padding: bool = True,
+        truncation: bool = True,
+        max_length: Optional[int] = None
+    ) -> torch.Tensor:
+        """Batch encode texts to token ids"""
+        batch = self.model(
+            texts,
+            padding=padding,
+            truncation=truncation,
+            max_length=max_length,
+            return_tensors="pt"
+        )
+        return batch.input_ids

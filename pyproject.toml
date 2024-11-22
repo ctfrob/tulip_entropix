@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "tulip-entropix"
+name = "entropix"
 version = "0.1.0"
 description = ""
 authors = ['cole-tulip']
@@ -15,9 +15,10 @@ rich = "^13.8.1"
 chex = "^0.1.87"
 tyro = "^0.8.11"
 jax = {extras = ["cuda12"], version = "^0.4.35"}
-pynvml = "^10.0.1"
+pynvml = "^11.0.0"
 GPUtil = "^1.4.0"
 psutil = "^5.9.5"
+python-dotenv = "^1.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.2"
