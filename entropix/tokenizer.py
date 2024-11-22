@@ -53,44 +53,53 @@ class Tokenizer:
 
     mergeable_ranks = load_tiktoken_bpe(model_path)
     num_base_tokens = len(mergeable_ranks)
-    special_tokens = [
-      '<|begin_of_text|>',
-      '<|end_of_text|>',
-      '<|reserved_special_token_0|>',
-      '<|reserved_special_token_1|>',
-      '<|finetune_right_pad_id|>',
-      '<|step_id|>',
-      '<|start_header_id|>',
-      '<|end_header_id|>',
-      '<|eom_id|>',  # end of message
-      '<|eot_id|>',  # end of turn
-      '<|python_tag|>',
-    ]
-    reserved_tokens = [
-      f'<|reserved_special_token_{2 + i}|>'
-      for i in range(self.num_reserved_special_tokens - len(special_tokens))
-    ]
-    special_tokens = special_tokens + reserved_tokens
+    
+    # Initialize with LLaMA special tokens
+    self.special_tokens = {
+        '<|begin_of_text|>': 128000,  # BOS
+        '<|end_of_text|>': 128001,    # EOS
+        '<|im_start|>': 128006,       # Chat start
+        '<|im_end|>': 128007,         # Chat end
+        '<|assistant|>': 128008,      # Assistant marker
+        '<|user|>': 128009,           # User marker
+        '<|finetune_right_pad_id|>': 128002,
+        '<|step_id|>': 128003,
+        '<|start_header_id|>': 128004,
+        '<|end_header_id|>': 128005,
+        '<|eom_id|>': 128007,         # Using im_end as eom
+        '<|eot_id|>': 128001,         # Using eos as eot
+        '<|python_tag|>': 128010,
+    }
 
-    self.special_tokens = {token: num_base_tokens + i for i, token in enumerate(special_tokens)}
+    # Add reserved tokens if needed (but we probably don't need them for LLaMA)
+    # for i in range(self.num_reserved_special_tokens - len(self.special_tokens)):
+    #     token = f'<|reserved_special_token_{i + len(self.special_tokens)}|>'
+    #     self.special_tokens[token] = 128011 + i  # Continue from where we left off
+
     self.model = tiktoken.Encoding(
-      name=Path(model_path).name,
-      pat_str=self.pat_str,
-      mergeable_ranks=mergeable_ranks,
-      special_tokens=self.special_tokens,
+        name=Path(model_path).name,
+        pat_str=self.pat_str,
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=self.special_tokens,
     )
 
-    self.n_words: int = num_base_tokens + len(special_tokens)
-    # BOS / EOS token IDs
+    self.n_words: int = 128256  # LLaMA's vocab size
+    
+    # Set token IDs directly from the dictionary
     self.bos_id: int = self.special_tokens['<|begin_of_text|>']
     self.eos_id: int = self.special_tokens['<|end_of_text|>']
     self.eot_id: int = self.special_tokens['<|eot_id|>']
     self.eom_id: int = self.special_tokens['<|eom_id|>']
     self.python_tag_id = self.special_tokens['<|python_tag|>']
     self.pad_id: int = self.special_tokens['<|finetune_right_pad_id|>']
+    
+    # Set stop tokens
     self.stop_tokens = [
-      self.special_tokens['<|eom_id|>'],
-      self.special_tokens['<|eot_id|>'],
+        self.special_tokens['<|eom_id|>'],    # 128007
+        self.special_tokens['<|eot_id|>'],    # 128001
+        self.special_tokens['<|im_end|>'],    # 128007
+        self.special_tokens['<|assistant|>'],  # 128008
+        self.special_tokens['<|user|>'],      # 128009
     ]
 
   def encode(
@@ -159,8 +168,28 @@ class Tokenizer:
     Returns:
         str: The decoded string.
     """
-    # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
-    return self.model.decode(cast(List[int], t))
+    try:
+        # First check if it's a special token or high-value token
+        if len(t) == 1:
+            token_val = t[0]
+            # Handle special tokens
+            if token_val >= 128000:
+                logger.debug(f"Special token encountered: {token_val}")
+                return ""
+            # Handle high-value tokens that might be beyond mergeable_ranks
+            if token_val >= 100000:
+                logger.debug(f"High-value token encountered: {token_val}")
+                return f"<|token_{token_val}|>"
+                
+        # For normal tokens, use the base tokenizer
+        return self.model.decode(cast(List[int], t))
+        
+    except Exception as e:
+        logger.warning(f"Failed to decode token {t}: {e}")
+        token_val = t[0] if len(t) == 1 else None
+        if token_val is not None:
+            return f"<|token_{token_val}|>"
+        return ""
 
   @staticmethod
   def _split_whitespaces_or_nonwhitespaces(s: str, max_consecutive_slice_len: int) -> Iterator[str]:

@@ -243,15 +243,39 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
                 gen_tokens.append(next_token)
                 
                 try:
-                    token_val = next_token.tolist()[0][0]            
+                    token_val = next_token.tolist()[0][0] 
+                    print(f"\nDEBUG INFO:")
+                    print(f"Token value being decoded: {token_val}")
+                    print(f"Is token in special tokens? {token_val in tokenizer.special_tokens.values()}")
+                    print(f"Max token value in vocabulary: {tokenizer.n_words}")
+                    print(f"Token type: {type(token_val)}")
+                    
+                    # Check if token is in valid range
+                    if token_val >= tokenizer.n_words:
+                        print(f"WARNING: Token {token_val} is outside vocabulary range [0, {tokenizer.n_words})")
+                        # Skip this token or handle appropriately
+                        continue 
+                    
                     if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                        print("Found stop token, breaking...")
                         break
 
                     out_token = tokenizer.decode([token_val])
+                    print(f"Successfully decoded token: {repr(out_token)}")
                     generated_text += out_token
                     print(out_token, end='', flush=True)
+                    
                 except Exception as e:
-                    break
+                    print("\nERROR DETAILS:")
+                    print(f"Token that caused error: {token_val}")
+                    print(f"Full next_token tensor: {next_token}")
+                    print(f"Full error: {str(e)}")
+                    
+                    # Print tokenizer info
+                    print("\nTOKENIZER INFO:")
+                    print(f"Tokenizer special tokens: {tokenizer.special_tokens}")
+                    print(f"Tokenizer vocabulary size: {tokenizer.n_words}")
+                    raise
             
             print("\n" + "="*80)
             print(prompt_handler.format_output(question, generated_text))

@@ -20,14 +20,32 @@ def rms_norm(x: jax.Array, w: jax.Array, eps: float = 1e-6) -> jax.Array:
   return w * (x * jax.lax.rsqrt(jax.lax.pow(x, 2).mean(-1, keepdims=True) + eps))
 
 def apply_rotary_emb(xq: jax.Array, xk: jax.Array, freqs_cis: jax.Array, dtype: jnp.dtype = jnp.float32) -> Tuple[jax.Array, jax.Array]:
-  reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
-  reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+  # Add shape validation
+  if xq.size == 0 or xk.size == 0:
+    print(f"Warning: Empty input tensors - xq shape: {xq.shape}, xk shape: {xk.shape}")
+    return xq.astype(dtype), xk.astype(dtype)
+    
+  if freqs_cis.size == 0:
+    print(f"Warning: Empty freqs_cis tensor - shape: {freqs_cis.shape}")
+    return xq.astype(dtype), xk.astype(dtype)
+
+  try:
+    reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
+    reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+  except ValueError as e:
+    print(f"Reshape failed - xq shape: {xq.shape}, xk shape: {xk.shape}") 
+    raise
   xq_ = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
   xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
   xq_out = xq_ * freqs_cis[None, :, None, :]
   xk_out = xk_ * freqs_cis[None, :, None, :]
-  xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
-  xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
+  try:
+    xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
+    xk_out = jnp.stack((jnp.real(xk_out), jnp.imag(xk_out)), axis=-1).reshape(*xk_out.shape[:-1], -1)
+  except ValueError as e:
+    print(f"Stack/reshape failed - xq_out shape: {xq_out.shape}")
+    raise
+
   return xq_out.astype(dtype), xk_out.astype(dtype)
 
 def attention(x: jax.Array, layer_weights: LayerWeights, model_params, cur_pos: int, layer_idx: int, freqs_cis: jax.Array, kvcache: KVCache, attn_mask: Optional[jax.Array] = None) -> Tuple[jax.Array, KVCache]:
