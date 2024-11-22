@@ -1,5 +1,6 @@
 from typing import Tuple, Literal, Optional
 import time
+import os
 
 import math
 from pathlib import Path
@@ -76,9 +77,7 @@ def main(
         dataset_path: Path = Path("entropix/data/US_qbank.jsonl")
     ):
     model_params = LLAMA_70B_PARAMS # LLAMA_70B_PARAMS or LLAMA_1B_PARAMS
-    print(f"Loading weights from: {weights_path.absolute()}")
     xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
-    print(f"Files in directory: {list(weights_path.glob('*.npy'))}")
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     sample_fn = jax.jit(sample)
@@ -247,7 +246,7 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
                     token_val = next_token.tolist()[0][0]            
                     if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
                         break
-                        
+
                     out_token = tokenizer.decode([token_val])
                     generated_text += out_token
                     print(out_token, end='', flush=True)
@@ -265,6 +264,8 @@ os.environ['XLA_FLAGS'] = (
     '--xla_gpu_enable_latency_hiding_scheduler=true '
     '--xla_gpu_enable_highest_priority_async_stream=true '
 )
+print("JAX devices:", jax.devices())
+print("Number of devices:", jax.device_count())
 
 if __name__ == '__main__':
     tyro.cli(main)
