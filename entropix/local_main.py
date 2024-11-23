@@ -21,6 +21,7 @@ from entropix.weights import load_weights
 from entropix.dslider import initialize_state
 from entropix.dslider_config import DEFAULT_DS_CONFIG
 from entropix.medqaprompt import MedicalQAPrompt
+from entropix.resultshandler import ResultsHandler
 from vectordb.retrieval_system import RetrievalSystem
 
 import logging
@@ -209,70 +210,77 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
 
     else:  # mode == "benchmark"
         prompt_handler = MedicalQAPrompt()
-
+        results_handler = ResultsHandler()
         prompts = prompt_handler.process_jsonl_file(str(dataset_path), max_questions)
 
-        print(f"\nProcessing {len(prompts)} questions with retrieval augmentation...")
+        for idx, (prompt, question) in enumerate(prompts):
+            try:
+                retrieved_context = retrieval_system.retrieve(question.question)
+                augmented_prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
+                print(augmented_prompt)
 
-        for prompt, question in prompts:
-            retrieved_context = retrieval_system.retrieve(question.question)
-            augmented_prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
-
-            print(augmented_prompt)
-            tokens = tokenizer.encode(augmented_prompt, bos=False, eos=False, allowed_special='all')
-            
-            cur_pos = 0
-            tokens = jnp.array([tokens], jnp.int32)
-            bsz, seqlen = tokens.shape
-            attn_mask = build_attn_mask(seqlen, cur_pos)
-            freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
-            kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
-            logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-            # Initialize state for sampling
-            state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
-            next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-            generated_text = tokenizer.decode([next_token.item()])
-            print(generated_text, end='', flush=True)
-            
-            cur_pos = seqlen
-            stop = jnp.array([128001, 128008, 128009])
-            gen_tokens = [next_token]
-            
-            while cur_pos < 8192:
-                cur_pos += 1
-                
-                logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-                
+                tokens = tokenizer.encode(augmented_prompt, bos=False, eos=False, allowed_special='all')
+                cur_pos = 0
+                tokens = jnp.array([tokens], jnp.int32)
+                bsz, seqlen = tokens.shape
+                attn_mask = build_attn_mask(seqlen, cur_pos)
+                freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
+                kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
+                logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
+                state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
                 next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-                
-                gen_tokens.append(next_token)
-                
-                try:
-                    token_val = next_token.tolist()[0][0]
-                    
-                    # Check if token is in valid range
-                    if token_val >= 128000:  # LLaMA special tokens
-                        print(f"Special token encountered: {token_val}")
-                        if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
-                            print("Found stop token, breaking...")
-                            break
-                        continue
-
-                    if token_val >= 100000:  # High value tokens
-                        print(f"High value token encountered: {token_val}")
-                        out_token = f"<|token_{token_val}|>"
-                    else:
-                        out_token = tokenizer.decode([token_val])
-                    generated_text += out_token
-                    print(out_token, end='', flush=True)
-
-                except Exception as e:
-                    print(f"\nError processing token {token_val}: {e}")
-                    print(f"Full token tensor: {next_token}")
-                    continue
+                generated_text = tokenizer.decode([next_token.item()])
+                print(generated_text, end='', flush=True)
             
-            print("\n" + "="*80)
-            print(prompt_handler.format_output(question, generated_text))
+                cur_pos = seqlen
+                stop = jnp.array([128001, 128008, 128009])
+                gen_tokens = [next_token]
+                
+                while cur_pos < 8192:
+                    cur_pos += 1
+                    logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+                    next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+                    gen_tokens.append(next_token)
+                
+                    try:
+                        token_val = next_token.tolist()[0][0]
+                        if token_val >= 128000:
+                            print(f"Special token encountered: {token_val}")
+                            if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                                print("Found stop token, breaking...")
+                                break
+                            continue
+
+                        if token_val >= 100000:  # High value tokens
+                            print(f"High value token encountered: {token_val}")
+                            out_token = f"<|token_{token_val}|>"
+                        else:
+                            out_token = tokenizer.decode([token_val])
+                        generated_text += out_token
+                        print(out_token, end='', flush=True)
+
+                    except Exception as e:
+                        print(f"\nError processing token {token_val}: {e}")
+                        print(f"Full token tensor: {next_token}")
+                        continue
+                
+                formatted_output = prompt_handler.format_output(question, generated_text)
+                print("\n" + "="*80)
+                print(formatted_output)
+                
+                results_handler.process_result(formatted_output, question_id=f"q_{idx}")
+                
+                if (idx + 1) % 10 == 0:
+                    stats = results_handler.get_stats()
+                    print(f"\nProgress: {idx + 1}/{len(prompts)} questions processed. "
+                          f"Success rate: {stats['success_rate']}")
+                    
+            except Exception as e:
+                logging.error(f"Error in result processing for question {idx}: {e}")
+                # Continue with next question even if this one fails
+                continue
+        
+        results_handler.finalize()
 
 import os
 os.environ['XLA_FLAGS'] = (

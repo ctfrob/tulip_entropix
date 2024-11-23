@@ -75,17 +75,20 @@ class Tokenizer:
         **kwargs
     ) -> List[int]:
         """Encode text to token ids"""
+        # Remove allowed_special if present in kwargs
+        kwargs.pop('allowed_special', None)
+        
         tokens = self.model.encode(
             text,
             add_special_tokens=False,
             **kwargs
-        )
-        
+    )
+    
         if bos:
             tokens.insert(0, self.bos_id)
         if eos:
             tokens.append(self.eos_id)
-            
+        
         return tokens
 
     def decode(self, token_ids: Sequence[int]) -> str:
