@@ -24,6 +24,7 @@ class RetrievalSystem:
         """Initialize the retrieval system"""
         self.config = config or RetrievalConfig()
         self.vector_dim = 3072  # text-embedding-3-large dimension
+        self.embedding_cache = {}
 
         print(f"Initializing retrieval system with URL: {os.getenv('QDRANT_URL')}")
         
@@ -107,18 +108,20 @@ class RetrievalSystem:
             return []
 
         processed_results = []
-        print("\nDebug processing results:")
-        print(f"Number of results before filtering: {len(results)}")
+        if self.config.debug:
+            print("\nDebug processing results:")
+            print(f"Number of results before filtering: {len(results)}")
         
         for i, result in enumerate(results):
-            print(f"\n=== Result {i+1} Details ===")
-            print(f"Score: {result.score}")
-            print(f"Payload keys: {result.payload.keys()}")
-            print(f"Metadata: {result.payload.get('metadata', {})}")
-            print(f"Text length: {len(result.payload.get('text', ''))}")
-            print("First 300 chars of text:")
-            print(result.payload.get('text', '')[:300])
-            print("="*50)
+            if self.config.debug:
+                print(f"\n=== Result {i+1} Details ===")
+                print(f"Score: {result.score}")
+                print(f"Payload keys: {result.payload.keys()}")
+                print(f"Metadata: {result.payload.get('metadata', {})}")
+                print(f"Text length: {len(result.payload.get('text', ''))}")
+                print("First 300 chars of text:")
+                print(result.payload.get('text', '')[:300])
+                print("="*50)
             
             if result.score < self.config.min_relevance_score:
                 print(f"Filtered out due to low score ({result.score} < {self.config.min_relevance_score})")

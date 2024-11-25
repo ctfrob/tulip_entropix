@@ -19,6 +19,10 @@ pynvml = "^11.0.0"
 GPUtil = "^1.4.0"
 psutil = "^5.9.5"
 python-dotenv = "^1.0.0"
+openai = "^1.55.1"
+qdrant-client = "^1.12.1"
+numpy = "^2.1.3"
+tqdm = "^4.67.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.2"
@@ -43,10 +47,12 @@ blobfile = "^3.0.0"
 [tool.poetry.group.embeddings.dependencies]
 transformers = "^4.45.1"
 torch = {version = "^2.0.0", extras = ["cuda12"]}
-qdrant-client = "^1.7.0"
+qdrant-client = "^1.12.1"
 python-dotenv = "^1.0.0"
-tqdm = "^4.66.0"
+tqdm = "^4.67.1"
 einops = "^0.7.0"
+openai = "^1.55.1"
+backoff = "^2.2.1"
 
 [tool.poetry.group.server.dependencies]
 fastapi = "^0.115.3"

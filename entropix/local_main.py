@@ -77,17 +77,23 @@ def build_attn_mask(seqlen: int, start_pos: int) -> jax.Array:
     return mask
 
 def main(
-        weights_path: Path = DEFAULT_WEIGHTS_PATH.joinpath('70B-Instruct'), #'1B-Instruct' or '70B-Instruct'
+        model_size: Literal["1B", "70B"] = "70B",
+        weights_path: Optional[Path] = None,
         mode: Literal["sort", "medqa_example", "benchmark"] = "sort",
         max_questions: Optional[int] = None,
         dataset_path: Path = Path("entropix/data/US_qbank.jsonl")
     ):
-    model_params = LLAMA_70B_PARAMS # LLAMA_70B_PARAMS or LLAMA_1B_PARAMS
+    model_params = LLAMA_1B_PARAMS if model_size == "1B" else LLAMA_70B_PARAMS
+
+    if weights_path is None:
+        weights_path = DEFAULT_WEIGHTS_PATH.joinpath(f"{model_size}-Instruct")
+    print(f"Loading {model_size} model from {weights_path}")
+
     xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     sample_fn = jax.jit(sample)
-    retrieval_system = RetrievalSystem()
+    retrieval_system = RetrievalSystem(model_params=model_params)
 
     if mode == "sort":
         prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>

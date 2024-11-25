@@ -1,39 +1,61 @@
-from typing import List, Dict, Optional, Union, Any
-from functools import partial
+from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 import os
-import jax
-import jax.numpy as jnp
 import numpy as np
 from pathlib import Path
 from qdrant_client import QdrantClient
 import logging
-from transformers import AutoTokenizer, AutoModel
-import torch
+from openai import OpenAI
 from dotenv import load_dotenv
+from entropix.config import ModelParams, MODEL_CONFIGS
 
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 @dataclass
 class RetrievalConfig:
     k: int = 3  # Number of documents to retrieve
     min_relevance_score: float = 0.3
-    max_context_length: int = 4096  # For prompt context window
+    max_context_length: Optional[int] = None
     batch_size: int = 32
-    collection_name: str = "textbooks"
+    collection_name: str = "textbooks_oaiembed"
     context_template: str = "\nContext: {context}\n"  # Template for RAG prompt injection
-    chunk_size: int = 512  # For tokenization
+    chunk_size: int = 512
+    debug: bool = False
+    
+    def adjust_for_model(self, model_params: ModelParams):
+        """Adjust retrieval parameters based on model size"""
+        if model_params.n_layers == MODEL_CONFIGS["1B"].n_layers:
+            # For 1B model, just get the single most relevant chunk
+            self.k = 1
+            self.max_context_length = 2048  # Conservative limit for 1B
+        else:
+            # For 70B model, get three chunks as before
+            self.k = 3
+            self.max_context_length = 3072  # More generous for 70B
+            
+        print(f"Adjusted for {'1B' if model_params.n_layers == MODEL_CONFIGS['1B'].n_layers else '70B'} model:")
+        print(f"- Retrieved chunks (k): {self.k}")
+        print(f"- Max context length: {self.max_context_length}")
+        return self
 
 class RetrievalSystem:
-    def __init__(self, config: Optional[RetrievalConfig] = None):
+    def __init__(self, config: Optional[RetrievalConfig] = None, model_params: Optional[ModelParams] = None):
         """Initialize the retrieval system"""
         self.config = config or RetrievalConfig()
+        if model_params:
+            is_1B = model_params.n_layers == MODEL_CONFIGS["1B"].n_layers
+            print(f"Initializing retrieval system for {'1B' if is_1B else '70B'} model")
+            self.config = self.config.adjust_for_model(model_params)
+        self.vector_dim = 3072  # text-embedding-3-large dimension
+        self.embedding_cache = {}
 
         print(f"Initializing retrieval system with URL: {os.getenv('QDRANT_URL')}")
         
-        try: 
+        try:
+            # Initialize OpenAI client
+            self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            
             # Initialize Qdrant client
             self.client = QdrantClient(
                 url=os.getenv("QDRANT_URL"),
@@ -42,131 +64,69 @@ class RetrievalSystem:
             collections = self.client.get_collections()
             print(f"Collections: {collections}")
         except Exception as e:
-            logger.error(f"Error initializing Qdrant client: {e}")
+            logger.error(f"Error initializing clients: {e}")
             raise
         
         collection_info = self.client.get_collection('textbooks')
         print(f"Collection info: {collection_info}")
-        
-        # Initialize model and embeddings
-        self.__init_model()
 
-    def __init_model(self):
-        """Initialize model and tokenizer using CDE approach"""
+    def encode_query(self, query: str) -> np.ndarray:
+        """Encode query using OpenAI embeddings API"""
         try:
-            # Initialize model and move to appropriate device
-            self.model = AutoModel.from_pretrained(
-                "jxm/cde-small-v1",
-                trust_remote_code=True
+            response = self.openai_client.embeddings.create(
+                input=query,
+                model="text-embedding-3-large"
             )
-            self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-            
-            # Move to device if GPU available
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model.to(self.device)
-            self.model.eval()
-            
-            logger.info("Model initialized successfully")
+            return np.array(response.data[0].embedding)
         except Exception as e:
-            logger.error(f"Error initializing model: {e}")
+            logger.error(f"Error encoding query: {e}")
             raise
 
-    def _get_first_stage_embeddings(self, text: str) -> jnp.ndarray:
-        """Generate first stage embeddings using CDE approach"""
-        document_prefix = "search_document: "
-        text_with_prefix = document_prefix + text
-        
-        # Get corpus size from model config
-        corpus_size = self.model.config.transductive_corpus_size
-        minicorpus_docs = [text_with_prefix] * corpus_size
-        
-        with torch.no_grad():
-            tokenized = self.tokenizer(
-                minicorpus_docs,
-                truncation=True,
-                padding=True,
-                max_length=self.config.chunk_size,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            embeddings = self.model.first_stage_model(**tokenized)
-            return jnp.array(embeddings.cpu().numpy())
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _compute_relevance_scores(self, query_embedding: jnp.ndarray, context_embeddings: jnp.ndarray) -> jnp.ndarray:
-        """Compute relevance scores between query and retrieved contexts"""
-        return jnp.dot(query_embedding, context_embeddings.T)
-
-    def _filter_by_relevance(self, results: List, scores: jnp.ndarray) -> List:
+    def _filter_by_relevance(self, results: List, min_score: float) -> List:
         """Filter results based on relevance scores"""
-        filtered = []
-        for result, score in zip(results, scores):
-            if score >= self.config.min_relevance_score:
-                filtered.append(result)
-        return filtered
+        return [r for r in results if r.score >= min_score]
 
     def format_for_prompt(self, results: List) -> str:
-        """Format retrieved contexts for RAG prompt"""
-        formatted_contexts = []
-        total_length = 0
+        """Format retrieved contexts for RAG prompt with strict token counting"""
+        from entropix.tokenizer import Tokenizer  # Import at top of file
         
+        tokenizer = Tokenizer('entropix/tokenizer.model')
+        formatted_contexts = []
+        total_tokens = 0
+        max_tokens = min(self.config.max_context_length, 3500)  # Conservative limit below 4096
+
         for result in results:
             context = result.payload.get('text', '').strip()
-            if total_length + len(context) > self.config.max_context_length:
-                available_length = self.config.max_context_length - total_length
-                if available_length > 0:
-                    context = context[:available_length]
-                else:
-                    break
-            
-            formatted_contexts.append(context)
-            total_length += len(context)
+            context_tokens = tokenizer.encode(context)
+
+            # Check if adding this context would exceed limit
+            if total_tokens + len(context_tokens) > max_tokens:
+            # Try to fit a truncated version
+                available_tokens = max_tokens - total_tokens
+                if available_tokens > 100:  # Only add if we can fit meaningful content
+                    truncated_text = tokenizer.decode(context_tokens[:available_tokens])
+                    formatted_contexts.append(truncated_text)
+                break
         
+        formatted_contexts.append(context)
+        total_tokens += len(context_tokens)
+            
         combined_context = "\n".join(formatted_contexts)
-        return self.config.context_template.format(context=combined_context)
-
-    def encode_query(self, query: str) -> jnp.ndarray:
-        """Encode query using two-stage CDE process"""
-        document_prefix = "search_document: "
-        query_text = document_prefix + query
+        formatted = self.config.context_template.format(context=combined_context)
         
-        print("Debug encoding:")
-
-        with torch.no_grad():
-            # First stage: get dataset embeddings
-            dataset_embeddings = self._get_first_stage_embeddings(query_text)
-            print(f"Dataset embeddings shape: {dataset_embeddings.shape}")
-            
-            # Second stage: generate final embedding
-            tokenized_query = self.tokenizer(
-                query_text,
-                truncation=True,
-                padding=True,
-                max_length=self.config.chunk_size,
-                return_tensors="pt"
-            ).to(self.device)
-            
-            # Generate final query embedding
-            query_embedding = self.model.second_stage_model(
-                input_ids=tokenized_query["input_ids"],
-                attention_mask=tokenized_query["attention_mask"],
-                dataset_embeddings=torch.from_numpy(np.array(dataset_embeddings)).to(self.device)
-            )
-
-            print(f"Pre-normalized query embedding shape: {query_embedding.shape}")
-            
-            # Normalize embedding
-            query_embedding = query_embedding / torch.norm(query_embedding, p=2, dim=1, keepdim=True)
-            
-            print(f"Post-normalized query embedding shape: {query_embedding.shape}")
-            
-            # Convert to JAX array
-            return jnp.array(query_embedding.cpu().numpy()[0])
+        # Final safety check
+        final_tokens = tokenizer.encode(formatted)
+        if len(final_tokens) > max_tokens:
+            print(f"Warning: Final context still too long ({len(final_tokens)} tokens), truncating...")
+            formatted = tokenizer.decode(final_tokens[:max_tokens])
+    
+        print(f"Final context length in tokens: {len(tokenizer.encode(formatted))}")
+        return formatted
 
     def retrieve(self, query: str) -> List[Dict[str, Any]]:
         """Retrieve relevant context from the vector database"""
         try:
-            # Encode query using two-stage process
+            # Encode query using OpenAI API
             query_vector = self.encode_query(query)
             print(f"Query vector shape: {query_vector.shape}")
             
@@ -174,47 +134,38 @@ class RetrievalSystem:
             results = self.client.search(
                 collection_name=self.config.collection_name,
                 query_vector=query_vector.tolist(),
-                limit=self.config.k * 2,
-                with_vectors=True
+                limit=self.config.k * 2
             )
             print(f"Number of results: {len(results)}")
-            if results:
-                print(f"First result vector shape: {len(results[0].vector)}")
 
-            return self._process_results(results, query_vector)
+            return self._process_results(results)
         except Exception as e:
             logger.error(f"Error retrieving context: {e}")
             raise
 
-    def _process_results(self, results: List, query_vector: jnp.ndarray) -> List[Dict]:
+    def _process_results(self, results: List) -> List[Dict]:
         """Process the search results"""
         if not results:
             return []
-            
-        # Extract vectors and compute relevance scores
-        vectors = jnp.array([r.vector for r in results])
-        scores = self._compute_relevance_scores(query_vector, vectors)
-
-        print("\nDebug processing results:")
-        print(f"Number of results before filtering: {len(results)}")
-        print(f"Relevance scores: {scores}")
-        print(f"Min relevance threshold: {self.config.min_relevance_score}")
 
         processed_results = []
-
-        for i, (result, score) in enumerate(zip(results, scores)):
-            print(f"\n=== Result {i+1} Details ===")
-            print(f"Score: {score}")
-            print(f"Payload keys: {result.payload.keys()}")
-            print(f"Metadata: {result.payload.get('metadata', {})}")
-            print(f"Full payload: {result.payload}")
-            print(f"Text length: {len(result.payload.get('text', ''))}")
-            print("First 300 chars of text:")
-            print(result.payload.get('text', '')[:300])
-            print("="*50)
+        if self.config.debug:
+            print("\nDebug processing results:")
+            print(f"Number of results before filtering: {len(results)}")
+        
+        for i, result in enumerate(results):
+            if self.config.debug:
+                print(f"\n=== Result {i+1} Details ===")
+                print(f"Score: {result.score}")
+                print(f"Payload keys: {result.payload.keys()}")
+                print(f"Metadata: {result.payload.get('metadata', {})}")
+                print(f"Text length: {len(result.payload.get('text', ''))}")
+                print("First 300 chars of text:")
+                print(result.payload.get('text', '')[:300])
+                print("="*50)
             
-            if score < self.config.min_relevance_score:
-                print(f"Filtered out due to low score ({float(score)} < {self.config.min_relevance_score})")
+            if result.score < self.config.min_relevance_score:
+                print(f"Filtered out due to low score ({result.score} < {self.config.min_relevance_score})")
                 continue
     
             metadata = result.payload.get('metadata', {})
@@ -222,7 +173,7 @@ class RetrievalSystem:
             text = result.payload.get('text', '').strip()
             
             processed_results.append({
-                'score': float(score),
+                'score': float(result.score),
                 'source': source,
                 'text': text,
                 'metadata': metadata
@@ -236,7 +187,7 @@ class RetrievalSystem:
         
         context_str = ""
         for r in final_results:
-            context_str += f"[Score: {r ['score']:.2f}] From {r['source']}:\n{r['text']}\n\n"
+            context_str += f"[Score: {r['score']:.2f}] From {r['source']}:\n{r['text']}\n\n"
         print("\nFinal formatted context:")
         print(context_str)
 
