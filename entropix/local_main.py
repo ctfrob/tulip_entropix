@@ -244,9 +244,14 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
                 
                 while cur_pos < 8192:
                     cur_pos += 1
-                    logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-                    next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-                    gen_tokens.append(next_token)
+                    try:
+                        logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+                        next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
+                        gen_tokens.append(next_token)
+                    except Exception as e:
+                        logging.warning(f"Encountered rare freqs_cis error in question {idx}: {e}. Skipping to next question.")
+                        print(f"\nSkipping question due to rare tensor error. Continuing to next one...")
+                        break
                 
                     try:
                         token_val = next_token.tolist()[0][0]

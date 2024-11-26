@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RetrievalConfig:
-    k: int = 3  # Number of documents to retrieve
+    k: int = 2  # Number of documents to retrieve
     min_relevance_score: float = 0.3
     max_context_length: Optional[int] = None
     batch_size: int = 32
@@ -30,8 +30,8 @@ class RetrievalConfig:
             self.k = 1
             self.max_context_length = 2048  # Conservative limit for 1B
         else:
-            # For 70B model, get three chunks as before
-            self.k = 3
+            # For 70B model, get two chunks as before
+            self.k = 2
             self.max_context_length = 3072  # More generous for 70B
             
         print(f"Adjusted for {'1B' if model_params.n_layers == MODEL_CONFIGS['1B'].n_layers else '70B'} model:")
@@ -67,7 +67,7 @@ class RetrievalSystem:
             logger.error(f"Error initializing clients: {e}")
             raise
         
-        collection_info = self.client.get_collection('textbooks')
+        collection_info = self.client.get_collection('textbooks_oaiembed')
         print(f"Collection info: {collection_info}")
 
     def encode_query(self, query: str) -> np.ndarray:
