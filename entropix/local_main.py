@@ -22,7 +22,7 @@ from entropix.dslider import initialize_state
 from entropix.dslider_config import DEFAULT_DS_CONFIG
 from entropix.medqaprompt import MedicalQAPrompt
 from entropix.resultshandler import ResultsHandler
-from vectordb.retrieval_system import RetrievalSystem
+from vectordb.research.retrieval_system_old import RetrievalSystem
 
 import logging
 
@@ -93,7 +93,7 @@ def main(
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     sample_fn = jax.jit(sample)
-    retrieval_system = RetrievalSystem(model_params=model_params)
+    retrieval_system = RetrievalSystem(model_params=model_params, xfmr_weights=xfmr_weights, xfmr_fn=xfmr_fn, sample_fn=sample_fn)
 
     if mode == "sort":
         prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>

@@ -10,7 +10,8 @@ class ResultsHandler:
         self.output_dir.mkdir(exist_ok=True)
         
         timestamp = datetime.now().strftime("%m_%d_%Y_%H%M")
-        self.output_file = self.output_dir / f"benchmark_results_{timestamp}.jsonl"
+        self.output_file = self.output_dir / f"benchmark_results_{timestamp}_eval.jsonl"
+        self.full_output_file = self.output_dir / f"benchmark_results_{timestamp}_fulleval.jsonl"
         
         # Keep correct answer pattern the same
         self.correct_pattern = re.compile(r"CORRECT\s+ANSWER:\s*([A-H])")
@@ -23,38 +24,39 @@ class ResultsHandler:
         logging.info(f"Initialized ResultsHandler. Output file: {self.output_file}")
 
     def find_selected_answer(self, text: str) -> str:
-        """Two-step approach to find selected answer"""
-        # First find "Selected Answer" marker
-        marker_match = re.search(r"\*\*Selected Answer[^A-H]*", text)
-        if not marker_match:
-            return None
+        """Find selected answer with flexible pattern matching"""
+        # Multiple patterns to catch different formats
+        patterns = [
+            r"(?:\*\*)?Selected Answer:?\s*([A-H])",  # Matches with/without asterisks, optional colon, flexible spacing
+            r"(?:\*\*)?Selected\s*Answer\s*(?:is|=)?\s*([A-H])",  # Matches variants with "is" or "="
+            r"Answer:\s*([A-H])",  # Simple "Answer: X" format
+            r"(?:chosen|final|selected)?\s*answer\s*(?:is|:|=)?\s*([A-H])"  # Case insensitive, very flexible
+        ]
+    
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1)
+    
+        # Last resort: find first standalone A-H after any mention of "answer"
+        if "answer" in text.lower():
+            after_answer = text[text.lower().find("answer"):]
+            letter_match = re.search(r'\b([A-H])\b', after_answer)
+            if letter_match:
+                return letter_match.group(1)
             
-        # Find the first letter A-H that follows within a reasonable range
-        end_pos = marker_match.end()
-        next_text = text[end_pos:end_pos + 50]  # Look ahead up to 50 chars
-        letter_match = re.search(r'([A-H])', next_text)
-        
-        return letter_match.group(1) if letter_match else None
+        return None
 
     def process_result(self, output_text: str, question_id: str = None) -> None:
-        """Process a single result and write to JSONL file"""
         try:
-            # Extract answers
             correct_match = self.correct_pattern.search(output_text)
             selected_answer = self.find_selected_answer(output_text)
             
             if not correct_match or not selected_answer:
-                # Debug log for pattern matching issues
-                logging.warning(f"Question {question_id}: Correct match found: {bool(correct_match)}, Selected answer found: {bool(selected_answer)}")
-                if not selected_answer:
-                    # For debugging
-                    start_idx = output_text.find("**Selected Answer")
-                    if start_idx != -1:
-                        context = output_text[start_idx:start_idx+100]
-                        logging.warning(f"Context around Selected Answer: {context}")
                 self.failed_extracts += 1
                 return
-                
+            
+            # Basic result for eval file
             result = {
                 "question_id": question_id,
                 "timestamp": datetime.now().isoformat(),
@@ -62,17 +64,26 @@ class ResultsHandler:
                 "selected_answer": selected_answer,
                 "is_correct": correct_match.group(1) == selected_answer
             }
-            
-            # Write to file
+        
+            # Full result including model output
+            full_result = {
+                **result,
+                "full_output": output_text
+            }
+        
+            # Write both files
             with open(self.output_file, 'a') as f:
                 f.write(json.dumps(result) + '\n')
             
+            with open(self.full_output_file, 'a') as f:
+                f.write(json.dumps(full_result) + '\n')
+        
             self.successful_extracts += 1
-            
+        
         except Exception as e:
             logging.error(f"Error processing result for question {question_id}: {e}")
             self.failed_extracts += 1
-        
+    
         self.total_processed += 1
 
     def get_stats(self) -> dict:
