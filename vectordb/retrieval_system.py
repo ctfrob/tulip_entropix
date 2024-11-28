@@ -1,220 +1,102 @@
 from typing import List, Dict, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import numpy as np
+import logging
+import time
 from pathlib import Path
 from qdrant_client import QdrantClient
-import logging
-
 from openai import OpenAI
 from dotenv import load_dotenv
-
-import jax
-import jax.numpy as jnp
-
-from entropix.config import ModelParams, MODEL_CONFIGS
-from entropix.kvcache import KVCache
-from entropix.sampler import DEFAULT_DS_CONFIG
-from entropix.tokenizer import Tokenizer
-from entropix.dslider import initialize_state
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 @dataclass
+class ModelSizeConfig:
+    k: int
+    max_context_length: Optional[int]
+    chunk_size: int
+
+@dataclass
 class RetrievalConfig:
-    k: int = 2  # Number of documents to retrieve
-    min_relevance_score: float = 0.3
+    k: int = 2
+    min_relevance_score: float = 0.25
     max_context_length: Optional[int] = None
-    batch_size: int = 32
     collection_name: str = "textbooks_oaiembed"
     context_template: str = "\nContext: {context}\n"
     chunk_size: int = 512
     debug: bool = False
-    
-    def adjust_for_model(self, model_params: ModelParams):
-        """Adjust retrieval parameters based on model size"""
-        if model_params.n_layers == MODEL_CONFIGS["1B"].n_layers:
-            self.k = 1
-            self.max_context_length = 2048
-        else:
-            self.k = 2
-            self.max_context_length = 3072
-            
-        print(f"Adjusted for {'1B' if model_params.n_layers == MODEL_CONFIGS['1B'].n_layers else '70B'} model:")
-        print(f"- Retrieved chunks (k): {self.k}")
-        print(f"- Max context length: {self.max_context_length}")
-        return self
+
+    # Define MODEL_CONFIGS as a class variable outside the dataclass fields
+    MODEL_CONFIGS = {
+        "1B": ModelSizeConfig(
+            k=1,
+            max_context_length=1500,
+            chunk_size=384
+        ),
+        "70B": ModelSizeConfig(
+            k=3,
+            max_context_length=6000,
+            chunk_size=512
+        )
+    }
+
+    @classmethod
+    def for_model(cls, model_size: str) -> 'RetrievalConfig':
+        """Create a RetrievalConfig instance optimized for given model size"""
+        model_config = cls.MODEL_CONFIGS.get(model_size, cls.MODEL_CONFIGS["1B"])
+        return cls(
+            k=model_config.k,
+            max_context_length=model_config.max_context_length,
+            chunk_size=model_config.chunk_size
+        )
 
 class RetrievalSystem:
-    def __init__(self, 
-                 config: Optional[RetrievalConfig] = None, 
-                 model_params: Optional[ModelParams] = None,
-                 xfmr_weights=None,
-                 xfmr_fn=None,
-                 sample_fn=None):
-        """Initialize the retrieval system"""
+    def __init__(self, config: Optional[RetrievalConfig] = None):
         self.config = config or RetrievalConfig()
-        self.model_params = model_params
-        if model_params:
-            is_1B = model_params.n_layers == MODEL_CONFIGS["1B"].n_layers
-            print(f"Initializing retrieval system for {'1B' if is_1B else '70B'} model")
-            self.config = self.config.adjust_for_model(model_params)
-        
-        # Store model components
-        self.xfmr_weights = xfmr_weights
-        self.xfmr_fn = xfmr_fn
-        self.sample_fn = sample_fn
-        self.tokenizer = Tokenizer('entropix/tokenizer.model')
-        
         self.vector_dim = 3072  # text-embedding-3-large dimension
-        self.embedding_cache = {}
-
-        self.concept_extraction_prompt = """You are a medical expert. Extract only essential medical concepts from this clinical question that would help retrieve relevant medical knowledge. Be extremely concise.
-Format as:
-Primary: [key diagnoses, conditions, symptoms]
-Risk Factors: [relevant patient history, behaviors]
-Assessment Areas: [key medical areas to consider]
-
-Question: {question}"""
-
-        print(f"Initializing retrieval system with URL: {os.getenv('QDRANT_URL')}")
         
         try:
-            # Initialize OpenAI client
             self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            
-            # Initialize Qdrant client
             self.client = QdrantClient(
                 url=os.getenv("QDRANT_URL"),
                 api_key=os.getenv("QDRANT_API_KEY")
             )
             collections = self.client.get_collections()
-            print(f"Collections: {collections}")
+            print(f"Connected to collections: {collections}")
         except Exception as e:
             logger.error(f"Error initializing clients: {e}")
             raise
-        
-        collection_info = self.client.get_collection('textbooks_oaiembed')
-        print(f"Collection info: {collection_info}")
 
-    def build_attn_mask(self, seqlen: int, start_pos: int) -> jax.Array:
-        """Build attention mask for transformer"""
-        mask = jnp.zeros((seqlen, seqlen), dtype=jnp.float32)
-        if seqlen > 1:
-            mask = jnp.full((seqlen, seqlen), float('-inf'))
-            mask = jnp.triu(mask, k=1)
-            mask = jnp.hstack([jnp.zeros((seqlen, start_pos)), mask], dtype=jnp.float32)
-        return mask
-
-    def precompute_freqs_cis(self, dim: int, end: int, theta: float = 500000.0) -> jax.Array:
-        """Precompute frequency cis for rotary embeddings"""
-        freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-        t = jnp.arange(end, dtype=jnp.float32)
-        freqs = jnp.outer(t, freqs)
-        return jnp.exp(1j * freqs)
-
-    def _generate_with_model(self, tokens: List[int]) -> str:
-        """Generate text using the main model"""
-        if not all([self.xfmr_weights, self.xfmr_fn, self.sample_fn, self.model_params]):
-            logger.warning("Model components not initialized, skipping concept extraction")
-            return ""
-
+    def _parse_concepts(self, concepts: str) -> Dict[str, str]:
+        """Parse structured concepts into a dictionary"""
+        concept_dict = {}
         try:
-            tokens = jnp.array([tokens], jnp.int32)
-            cur_pos = 0
-            bsz, seqlen = tokens.shape
+            current_key = None
+            current_value = []
             
-            # Setup model components
-            attn_mask = self.build_attn_mask(seqlen, cur_pos)
-            freqs_cis = self.precompute_freqs_cis(
-                self.model_params.head_dim, 
-                self.model_params.max_seq_len,
-                self.model_params.rope_theta
-            )
-            kvcache = KVCache.new(
-                self.model_params.n_layers,
-                bsz,
-                self.model_params.max_seq_len,
-                self.model_params.n_local_kv_heads,
-                self.model_params.head_dim
-            )
-
-            # Initial forward pass
-            logits, kvcache, _, _ = self.xfmr_fn(
-                self.xfmr_weights,
-                self.model_params,
-                tokens,
-                cur_pos,
-                freqs_cis[:seqlen],
-                kvcache,
-                attn_mask=attn_mask
-            )
-            
-            # Generate concepts
-            state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
-            generated_text = []
-            cur_pos = seqlen
-            
-            while cur_pos < 8192:
-                next_token, state = self.sample_fn(state, logits[:, -1], DEFAULT_DS_CONFIG)
-                token_val = next_token.tolist()[0][0]
-                
-                if token_val in [self.tokenizer.eot_id, self.tokenizer.eom_id]:
-                    break
+            for line in concepts.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
                     
-                out_token = self.tokenizer.decode([token_val])
-                generated_text.append(out_token)
+                if any(key in line for key in ["Primary:", "Risk Factors:", "Assessment Areas:"]):
+                    if current_key and current_value:
+                        concept_dict[current_key] = ' '.join(current_value)
+                    current_key = line.split(':')[0].strip()
+                    current_value = [line.split(':', 1)[1].strip()]
+                else:
+                    if current_key:
+                        current_value.append(line)
+            
+            if current_key and current_value:
+                concept_dict[current_key] = ' '.join(current_value)
                 
-                logits, kvcache, _, _ = self.xfmr_fn(
-                    self.xfmr_weights,
-                    self.model_params,
-                    next_token,
-                    cur_pos,
-                    freqs_cis[cur_pos:cur_pos+1],
-                    kvcache
-                )
-                cur_pos += 1
-            
-            return ''.join(generated_text)
-            
         except Exception as e:
-            logger.error(f"Error in concept generation: {e}")
-            return ""
-
-    def extract_medical_concepts(self, query: str) -> str:
-        """Extract key medical concepts from the query"""
-        try:
-            tokens = self.tokenizer.encode(
-                self.concept_extraction_prompt.format(question=query),
-                bos=False,
-                eos=False,
-                allowed_special='all'
-            )
+            logger.error(f"Error parsing concepts: {e}")
             
-            generated_concepts = self._generate_with_model(tokens)
-            concepts = self._clean_concept_output(generated_concepts)
-            
-            if self.config.debug:
-                print(f"Extracted concepts:\n{concepts}")
-            
-            return concepts
-            
-        except Exception as e:
-            logger.warning(f"Concept extraction failed: {e}")
-            return ""
-
-    def _clean_concept_output(self, text: str) -> str:
-        """Clean and format concept extraction output"""
-        text = text.replace("<|begin_of_text|>", "").replace("<|end_of_text|>", "")
-        
-        if "Primary:" in text:
-            text = text[text.find("Primary:"):]
-            
-        if "<|" in text:
-            text = text[:text.find("<|")]
-            
-        return text.strip()
+        return concept_dict
 
     def encode_query(self, query: str) -> np.ndarray:
         """Encode query using OpenAI embeddings API"""
@@ -228,89 +110,70 @@ Question: {question}"""
             logger.error(f"Error encoding query: {e}")
             raise
 
-    def retrieve(self, query: str) -> List[Dict[str, Any]]:
-        """Retrieve relevant context with concept enhancement"""
+    def retrieve(self, question: str, concepts: Optional[str] = None) -> List[Dict[str, Any]]:
+        print(f"\n[Retrieval] Starting retrieval process...")
+        start_time = time.time()
+        
         try:
-            # Extract medical concepts
-            concepts = self.extract_medical_concepts(query) if all([
-                self.xfmr_weights, self.xfmr_fn, self.sample_fn, self.model_params
-            ]) else ""
+            # Build structured medical query
+            structured_query = [
+                "Medical search:",
+                question.strip()
+            ]
             
-            # Create enhanced query
-            enhanced_query = query
+            # Add concepts if available
             if concepts:
-                enhanced_query = f"""Clinical Question: {query}
-Relevant Medical Concepts: {concepts}"""
+                concept_dict = self._parse_concepts(concepts)
+                print(f"[Retrieval Debug] Parsed concepts: {concept_dict}")
+                
+                if concept_dict.get('Primary'):
+                    structured_query.append(f"Key conditions: {concept_dict['Primary']}")
+                if concept_dict.get('Risk Factors'):
+                    structured_query.append(f"Clinical findings: {concept_dict['Risk Factors']}")
+                if concept_dict.get('Assessment Areas'):
+                    structured_query.append(f"Medical domains: {concept_dict['Assessment Areas']}")
             
-            if self.config.debug:
-                print(f"Enhanced query:\n{enhanced_query}")
+            enhanced_query = '\n'.join(structured_query)
+            print(f"[Retrieval Debug] Enhanced query:\n{enhanced_query}")
             
-            # Generate embedding and search
+            # Make sure we're in RetrievalSystem
+            assert hasattr(self, 'config'), "Must be called from RetrievalSystem"
+            
             query_vector = self.encode_query(enhanced_query)
+            print(f"[Retrieval Debug] Generated embedding vector")
             
+            print(f"[Retrieval Debug] Self type: {type(self)}")
+            print(f"[Retrieval Debug] Config type: {type(self.config)}")
+            print(f"[Retrieval Debug] Collection name: {self.config.collection_name}")
+            
+            # Use self.config for RetrievalSystem settings
             results = self.client.search(
-                collection_name=self.config.collection_name,
+                collection_name=self.config.collection_name,  # From RetrievalConfig
                 query_vector=query_vector.tolist(),
-                limit=self.config.k * 2
+                limit=self.config.k * 2,  # From RetrievalConfig
+                score_threshold=self.config.min_relevance_score  # From RetrievalConfig
             )
+            
+            if results:
+                print(f"[Retrieval Debug] Raw results: {len(results)}")
+                for r in results[:2]:
+                    print(f"[Retrieval Debug] Score: {r.score:.3f}")
             
             return self._process_results(results)
             
         except Exception as e:
-            logger.error(f"Error in enhanced retrieval: {e}")
-            raise
-
-    def _filter_by_relevance(self, results: List, min_score: float) -> List:
-        """Filter results based on relevance scores"""
-        return [r for r in results if r.score >= min_score]
-
-    def format_for_prompt(self, results: List) -> str:
-        """Format retrieved contexts for RAG prompt with strict token counting"""
-        formatted_contexts = []
-        total_tokens = 0
-        max_tokens = min(self.config.max_context_length, 3500)
-
-        for result in results:
-            context = result.payload.get('text', '').strip()
-            context_tokens = self.tokenizer.encode(context)
-
-            if total_tokens + len(context_tokens) > max_tokens:
-                available_tokens = max_tokens - total_tokens
-                if available_tokens > 100:
-                    truncated_text = self.tokenizer.decode(context_tokens[:available_tokens])
-                    formatted_contexts.append(truncated_text)
-                break
-            
-            formatted_contexts.append(context)
-            total_tokens += len(context_tokens)
-            
-        combined_context = "\n".join(formatted_contexts)
-        formatted = self.config.context_template.format(context=combined_context)
+            print(f"[Retrieval Error] {str(e)}")
+            logger.error(f"Error in retrieval: {e}")
+            return []
         
-        final_tokens = self.tokenizer.encode(formatted)
-        if len(final_tokens) > max_tokens:
-            print(f"Warning: Final context too long ({len(final_tokens)} tokens), truncating...")
-            formatted = self.tokenizer.decode(final_tokens[:max_tokens])
-    
-        print(f"Final context length in tokens: {len(self.tokenizer.encode(formatted))}")
-        return formatted
-
     def _process_results(self, results: List) -> List[Dict]:
-        """Process the search results"""
+        """Process and filter search results"""
         if not results:
             return []
 
         processed_results = []
-        if self.config.debug:
-            print(f"\nNumber of results before filtering: {len(results)}")
         
-        for i, result in enumerate(results):
-            if self.config.debug:
-                print(f"\n=== Result {i+1} Details ===")
-                print(f"Score: {result.score}")
-                print(f"Payload keys: {result.payload.keys()}")
-                print(f"Metadata: {result.payload.get('metadata', {})}")
-            
+        for result in results:
             if result.score < self.config.min_relevance_score:
                 continue
     
@@ -325,6 +188,7 @@ Relevant Medical Concepts: {concepts}"""
                 'metadata': metadata
             })
 
+        # Sort by score and take top k
         processed_results.sort(key=lambda x: x['score'], reverse=True)
         final_results = processed_results[:self.config.k]
         
@@ -336,9 +200,18 @@ Relevant Medical Concepts: {concepts}"""
 
         return final_results
 
-    async def batch_retrieve(self, queries: List[str]) -> List[Dict]:
-        """Batch retrieval for multiple queries"""
-        return [await self.retrieve(query) for query in queries]
+    def format_for_prompt(self, results: List[Dict]) -> str:
+        """Format retrieved contexts for inclusion in the prompt"""
+        if not results:
+            return self.config.context_template.format(context="No relevant context found.")
+            
+        contexts = []
+        for result in results:
+            context = f"[From {result['source']} (Relevance: {result['score']:.2f})]:\n{result['text']}"
+            contexts.append(context)
+            
+        combined_context = "\n\n".join(contexts)
+        return self.config.context_template.format(context=combined_context)
 
     def close(self):
         """Cleanup and close connections"""

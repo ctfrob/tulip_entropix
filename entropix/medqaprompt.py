@@ -2,6 +2,9 @@ import json
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 from pathlib import Path
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 @dataclass
 class MedicalQuestion:

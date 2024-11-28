@@ -22,7 +22,8 @@ from entropix.dslider import initialize_state
 from entropix.dslider_config import DEFAULT_DS_CONFIG
 from entropix.medqaprompt import MedicalQAPrompt
 from entropix.resultshandler import ResultsHandler
-from vectordb.research.retrieval_system_old import RetrievalSystem
+from vectordb.conceptextractor import ConceptExtractor
+from vectordb.retrieval_system import RetrievalSystem, RetrievalConfig
 
 import logging
 
@@ -93,7 +94,14 @@ def main(
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     sample_fn = jax.jit(sample)
-    retrieval_system = RetrievalSystem(model_params=model_params, xfmr_weights=xfmr_weights, xfmr_fn=xfmr_fn, sample_fn=sample_fn)
+    concept_extractor = ConceptExtractor(
+        model_params=model_params,
+        xfmr_weights=xfmr_weights,
+        xfmr_fn=xfmr_fn,
+        sample_fn=sample_fn
+    )
+    retrieval_config = RetrievalConfig.for_model(model_size)
+    retrieval_system = RetrievalSystem(config=retrieval_config)
 
     if mode == "sort":
         prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
@@ -220,8 +228,24 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
         prompts = prompt_handler.process_jsonl_file(str(dataset_path), max_questions)
 
         for idx, (prompt, question) in enumerate(prompts):
+            print(f"\n{'='*80}")
+            print(f"Processing Question {idx+1}/{len(prompts)}")
+            print(f"Question type: {question.meta_info}")
+            loop_start = time.time()
             try:
-                retrieved_context = retrieval_system.retrieve(question.question)
+                print("\nStep 1: Extracting concepts...")
+                concepts = concept_extractor.extract_concepts(question.question)
+                if concepts:
+                    print(f"[ConceptExtractor] Generated concepts:\n{concepts}\n")
+                else:
+                    print("[ConceptExtractor] No concepts generated. Using original question.")
+
+                print("\nStep 2: Retrieving context...")
+                retrieved_context = retrieval_system.retrieve(question.question, concepts=concepts)
+                if not retrieved_context:
+                    print("[Warning] No context retrieved, continuing with base prompt...")
+                
+                print("\nStep 3: Generating answer...")
                 augmented_prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
                 print(augmented_prompt)
 
@@ -274,6 +298,10 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
                         print(f"\nError processing token {token_val}: {e}")
                         print(f"Full token tensor: {next_token}")
                         continue
+                
+                elapsed = time.time() - loop_start
+                print(f"\nQuestion completed in {elapsed:.2f}s")
+                print(f"{'='*80}\n")
                 
                 formatted_output = prompt_handler.format_output(question, generated_text)
                 print("\n" + "="*80)
