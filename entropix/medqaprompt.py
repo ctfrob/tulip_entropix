@@ -46,6 +46,7 @@ The books you read and were trained on include -
 - Schwartz's Principles of Surgery, 11th Edition (2019)
 
 Relevant chunks of these textbooks will be provided to you as context but you will also need to draw from your training data which includes the full text of the textbooks in order to answer each question correctly.
+These chunks should be used as reference material, because they are textbooks, they may also contain questions but remember to focus on the question at hand (ignore the questions in the context).
 
 Please follow the below guidance as you think about formulating your approach and answer - 
 
@@ -267,7 +268,16 @@ and based on this analysis select ONE answer. State that answer at the end of yo
         context_section = "\nRELEVANT CONTEXT:\n"
         for ctx in retrieved_contexts:
             context_section += f"[Score: {ctx['score']:.2f}] From {ctx['source']}:\n{ctx['text']}\n\n"
-            
+       
+        print("\n[Prompt Debug] Final augmented prompt:")
+        print("-" * 80)
+        print(f"{original_prompt}\n")
+        print("RETRIEVED CONTEXTS ADDED:")
+        for ctx in retrieved_contexts:
+            print(f"\n[Score: {ctx['score']:.2f}] From {ctx['source']}:")
+            print(f"{ctx['text']}")
+        print("-" * 80)
+       
         # Reassemble with context
         return (f"{system_part}"
                 f"<|start_header_id|>user<|end_header_id|>\n"

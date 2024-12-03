@@ -114,11 +114,16 @@ class RetrievalSystem:
             enhanced_query = '\n'.join(structured_query)
             print(f"[Retrieval Debug] Enhanced query:\n{enhanced_query}")
             
+            print(f"\n[Retrieval Debug] Generated enhanced query:")
+            print("-" * 80)
+            print(enhanced_query)
+            print("-" * 80)
+            
             # Make sure we're in RetrievalSystem
             assert hasattr(self, 'config'), "Must be called from RetrievalSystem"
             
             query_vector = self.encode_query(enhanced_query)
-            print(f"[Retrieval Debug] Generated embedding vector")
+            print(f"\n[Retrieval Debug] Generated embedding vector shape: {query_vector.shape}")
             
             print(f"[Retrieval Debug] Self type: {type(self)}")
             print(f"[Retrieval Debug] Config type: {type(self.config)}")
@@ -136,6 +141,12 @@ class RetrievalSystem:
                 print(f"[Retrieval Debug] Raw results: {len(results)}")
                 for r in results[:2]:
                     print(f"[Retrieval Debug] Score: {r.score:.3f}")
+            
+            print("\n[Retrieval Debug] Full retrieved contexts:")
+            for idx, result in enumerate(results):
+                print(f"\nContext {idx + 1} [Score: {result.score:.3f}] From {result.payload['source']}:")
+                print(f"{result.payload['text']}\n")
+                print("-" * 80)
             
             return self._process_results(results)
             

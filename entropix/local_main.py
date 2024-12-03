@@ -105,6 +105,14 @@ def main(
     retrieval_system = RetrievalSystem(config=retrieval_config)
 
     def process_question(prompt, question=None):
+        """Process a single question"""
+        print("\n[Processing Debug] Starting new question processing")
+        print("-" * 80)
+        print(f"Input prompt length: {len(prompt)}")
+        if question:
+            print(f"Question type: {question.meta_info}")
+        print("-" * 80)
+
         # Calculate safe lengths
         SYSTEM_RESERVE = 2048
         GENERATION_RESERVE = 1024  # Reserve tokens for generation
@@ -115,6 +123,10 @@ def main(
         if len(tokens) > MAX_SAFE_LENGTH:
             print(f"Warning: Question is too long ({len(tokens)} tokens), truncating to {MAX_SAFE_LENGTH} tokens")
             tokens = tokens[:MAX_SAFE_LENGTH]
+        
+        print(f"\n[Processing Debug] Tokenized input:")
+        print(f"Number of tokens: {len(tokens)}")
+        print(f"Max sequence length: {model_params.max_seq_len}")
 
         cur_pos = 0
         tokens = jnp.array([tokens], jnp.int32)

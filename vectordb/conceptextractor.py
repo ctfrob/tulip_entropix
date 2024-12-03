@@ -37,6 +37,10 @@ class OpenAIConceptExtractor:
 
     def extract_concepts(self, question: str) -> str:
         """Extract medical concepts using OpenAI API"""
+        print(f"\n[Concept Extraction Debug] Processing question:")
+        print("-" * 80)
+        print(question)
+        print("-" * 80)
         start_time = time.time()
         
         try:
@@ -51,6 +55,11 @@ class OpenAIConceptExtractor:
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens
             )
+            
+            print(f"\n[Concept Extraction Debug] Raw extracted concepts:")
+            print("-" * 80)
+            print(response.choices[0].message.content)
+            print("-" * 80)
             
             concepts = self._clean_output(response.choices[0].message.content)
             
