@@ -8,15 +8,10 @@ from pathlib import Path
 from qdrant_client import QdrantClient
 from openai import OpenAI
 from dotenv import load_dotenv
+from entropix.config import ModelConfig
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-
-@dataclass
-class ModelSizeConfig:
-    k: int
-    max_context_length: Optional[int]
-    chunk_size: int
 
 @dataclass
 class RetrievalConfig:
@@ -28,28 +23,11 @@ class RetrievalConfig:
     chunk_size: int = 512
     debug: bool = False
 
-    # Define MODEL_CONFIGS as a class variable outside the dataclass fields
-    MODEL_CONFIGS = {
-        "1B": ModelSizeConfig(
-            k=1,
-            max_context_length=1500,
-            chunk_size=384
-        ),
-        "70B": ModelSizeConfig(
-            k=3,
-            max_context_length=6000,
-            chunk_size=512
-        )
-    }
-
     @classmethod
-    def for_model(cls, model_size: str) -> 'RetrievalConfig':
-        """Create a RetrievalConfig instance optimized for given model size"""
-        model_config = cls.MODEL_CONFIGS.get(model_size, cls.MODEL_CONFIGS["1B"])
+    def from_model_config(cls, model_config: ModelConfig) -> 'RetrievalConfig':
         return cls(
-            k=model_config.k,
-            max_context_length=model_config.max_context_length,
-            chunk_size=model_config.chunk_size
+            k=model_config.retrieval_chunks,
+            max_context_length=model_config.retrieval_context_length
         )
 
 class RetrievalSystem:

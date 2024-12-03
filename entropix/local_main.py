@@ -15,14 +15,14 @@ import tyro
 from entropix.config import LLAMA_1B_PARAMS, LLAMA_70B_PARAMS
 from entropix.kvcache import KVCache
 from entropix.model import xfmr
-from entropix.sampler import SamplerConfig, sample
+from entropix.sampler import sample # sample wraps DSlider with additional sampling logic
 from entropix.tokenizer import Tokenizer
 from entropix.weights import load_weights
 from entropix.dslider import initialize_state
 from entropix.dslider_config import DEFAULT_DS_CONFIG
 from entropix.medqaprompt import MedicalQAPrompt
 from entropix.resultshandler import ResultsHandler
-from vectordb.conceptextractor import ConceptExtractor
+from vectordb.conceptextractor import OpenAIConceptExtractor
 from vectordb.retrieval_system import RetrievalSystem, RetrievalConfig
 
 import logging
@@ -83,28 +83,77 @@ def main(
         mode: Literal["sort", "medqa_example", "benchmark"] = "sort",
         max_questions: Optional[int] = None,
         dataset_path: Path = Path("entropix/data/US_qbank.jsonl")
-    ):
+):
+    """
+    Main function to run the model in different modes.
+    """
     model_params = LLAMA_1B_PARAMS if model_size == "1B" else LLAMA_70B_PARAMS
-
     if weights_path is None:
         weights_path = DEFAULT_WEIGHTS_PATH.joinpath(f"{model_size}-Instruct")
+    
     print(f"Loading {model_size} model from {weights_path}")
 
     xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
-    sample_fn = jax.jit(sample)
-    concept_extractor = ConceptExtractor(
-        model_params=model_params,
-        xfmr_weights=xfmr_weights,
-        xfmr_fn=xfmr_fn,
-        sample_fn=sample_fn
+    concept_extractor = OpenAIConceptExtractor()
+    retrieval_config = RetrievalConfig(
+        k=model_params.retrieval_chunks,
+        max_context_length=model_params.retrieval_context_length
     )
-    retrieval_config = RetrievalConfig.for_model(model_size)
     retrieval_system = RetrievalSystem(config=retrieval_config)
 
+    def process_question(prompt, question=None, results_handler=None, question_counter=None):
+        cur_pos = 0
+        tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
+        tokens = jnp.array([tokens], jnp.int32)
+        bsz, seqlen = tokens.shape
+
+        # Setup attention and frequency components
+        attn_mask = build_attn_mask(seqlen, cur_pos)
+        freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
+
+        # Initialize KV Cache
+        kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
+
+        # Initial FWD pass
+        logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
+
+        # Initialize state for this question
+        state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
+        key = jax.random.PRNGKey(0)
+
+        # Generation loop
+        generated_text = ""
+        cur_pos = seqlen
+        gen_tokens = []
+
+        while cur_pos < 8192:
+            key, subkey = jax.random.split(key)
+            state, next_token = sample(state, logits[:, -1], DEFAULT_DS_CONFIG, key=subkey)
+
+            try:
+                token_val = next_token.tolist()[0][0]
+                if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                    break
+                
+                out_token = tokenizer.decode([token_val])
+                generated_text += out_token
+                print(out_token, end='', flush=True)
+
+                # Update for next iteration
+                next_token = next_token.reshape(bsz, 1)
+                logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+            except Exception as e:
+                print(f"\nError processing token {token_val}: {e}")
+                break
+
+            cur_pos += 1
+
+        return generated_text
+
     if mode == "sort":
-        prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+        prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|> 
 
 Environment: ipython
 Cutting Knowledge Date: December 2023
@@ -114,40 +163,7 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
 
 """
         print(prompt)
-        tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
-        # Generation loop moved into main
-        cur_pos = 0
-        tokens = jnp.array([tokens], jnp.int32)
-        bsz, seqlen = tokens.shape
-        attn_mask = build_attn_mask(seqlen, cur_pos)
-        freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
-        kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
-        logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-        # Initialize state for sampling
-        state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
-        next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-        print(tokenizer.decode([next_token.item()]), end='', flush=True)
-        
-        cur_pos = seqlen
-        stop = jnp.array([128001, 128008, 128009])
-        gen_tokens = [next_token]
-        
-        while cur_pos < 8192:
-            cur_pos += 1
-            logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-            next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-            gen_tokens.append(next_token)
-            
-            try:
-                token_val = next_token.tolist()[0][0]            
-                if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
-                    break
-                    
-                out_token = tokenizer.decode([token_val])
-                print(out_token, end='', flush=True)
-            except Exception as e:
-                print(f"\nError in token processing: {e}")
-                break
+        process_question(prompt)
 
     elif mode == "medqa_example":
         print("\nStarting MedQA example...")
@@ -172,153 +188,48 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
         prompt, question = prompt_handler.get_prompt(example_question)
         prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
 
-        tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
-        print(f"Token shape: {jnp.array([tokens], jnp.int32).shape}")
-        
-        # Generation loop moved into main
-        cur_pos = 0
-        tokens = jnp.array([tokens], jnp.int32)
-        bsz, seqlen = tokens.shape
-        attn_mask = build_attn_mask(seqlen, cur_pos)
-        freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
-        kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
-        logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-        # Initialize state for sampling
-        state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
-        next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-        generated_text = tokenizer.decode([next_token.item()])
-        print(f"\nInitial token: {generated_text}")
-        print(generated_text, end='', flush=True)
-        
-        cur_pos = seqlen
-        stop = jnp.array([128001, 128008, 128009])
-        gen_tokens = [next_token]
-        
-        while cur_pos < 8192:
-            cur_pos += 1
-            logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-            next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-            gen_tokens.append(next_token)
-            
-            try:
-                token_val = next_token.tolist()[0][0]            
-                if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
-                    break
-                    
-                out_token = tokenizer.decode([token_val])
-                print(out_token, end='', flush=True)
-            except Exception as e:
-                print(f"\nError in token processing: {e}")
-                break
-
-        time.sleep(1)
-
-        if "<|begin_of_text|>" in generated_text:
-            generated_text = generated_text.split("Answer:")[1].strip()
+        generated_text = process_question(prompt, question)
 
         with open('debug_output.txt', 'w') as f:
-          f.write(f"Generated text length: {len(generated_text)}\n")
-          f.write(f"Generated text:\n{generated_text}\n")
-          f.write("\nFormatted output:\n")
-          f.write(prompt_handler.format_output(question, generated_text))
+            f.write(f"Generated text length: {len(generated_text)}\n")
+            f.write(f"Generated text:\n{generated_text}\n")
+            f.write("\nFormatted output:\n")
+            f.write(prompt_handler.format_output(question, generated_text))
 
     else:  # mode == "benchmark"
         prompt_handler = MedicalQAPrompt()
         results_handler = ResultsHandler()
+        question_counter = 0
         prompts = prompt_handler.process_jsonl_file(str(dataset_path), max_questions)
 
-        for idx, (prompt, question) in enumerate(prompts):
-            print(f"\n{'='*80}")
-            print(f"Processing Question {idx+1}/{len(prompts)}")
-            print(f"Question type: {question.meta_info}")
-            loop_start = time.time()
+        for prompt, question in prompts:
             try:
-                print("\nStep 1: Extracting concepts...")
+                print(f"Processing question {question_counter + 1}")
                 concepts = concept_extractor.extract_concepts(question.question)
-                if concepts:
-                    print(f"[ConceptExtractor] Generated concepts:\n{concepts}\n")
-                else:
-                    print("[ConceptExtractor] No concepts generated. Using original question.")
-
-                print("\nStep 2: Retrieving context...")
-                retrieved_context = retrieval_system.retrieve(question.question, concepts=concepts)
-                if not retrieved_context:
-                    print("[Warning] No context retrieved, continuing with base prompt...")
-                
-                print("\nStep 3: Generating answer...")
+                retrieved_context = retrieval_system.retrieve(question.question, concepts)
                 augmented_prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
-                print(augmented_prompt)
 
-                tokens = tokenizer.encode(augmented_prompt, bos=False, eos=False, allowed_special='all')
-                cur_pos = 0
-                tokens = jnp.array([tokens], jnp.int32)
-                bsz, seqlen = tokens.shape
-                attn_mask = build_attn_mask(seqlen, cur_pos)
-                freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
-                kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
-                logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-                state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
-                next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-                generated_text = tokenizer.decode([next_token.item()])
-                print(generated_text, end='', flush=True)
-            
-                cur_pos = seqlen
-                stop = jnp.array([128001, 128008, 128009])
-                gen_tokens = [next_token]
-                
-                while cur_pos < 8192:
-                    cur_pos += 1
-                    try:
-                        logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-                        next_token, state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG)
-                        gen_tokens.append(next_token)
-                    except Exception as e:
-                        logging.warning(f"Encountered rare freqs_cis error in question {idx}: {e}. Skipping to next question.")
-                        print(f"\nSkipping question due to rare tensor error. Continuing to next one...")
-                        break
-                
-                    try:
-                        token_val = next_token.tolist()[0][0]
-                        if token_val >= 128000:
-                            print(f"Special token encountered: {token_val}")
-                            if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
-                                print("Found stop token, breaking...")
-                                break
-                            continue
+                generated_text = process_question(augmented_prompt, question=question)
+                try:
+                    formatted_output = prompt_handler.format_output(question, generated_text)
+                    print("\n" + "="*80)
+                    print(formatted_output)
 
-                        if token_val >= 100000:  # High value tokens
-                            print(f"High value token encountered: {token_val}")
-                            out_token = f"<|token_{token_val}|>"
-                        else:
-                            out_token = tokenizer.decode([token_val])
-                        generated_text += out_token
-                        print(out_token, end='', flush=True)
+                    results_handler.process_result(formatted_output, question_id=f"q_{question_counter}")
+                    if (question_counter + 1) % 10 == 0:
+                        stats = results_handler.get_stats()
+                        print(f"\nProgress: {question_counter + 1}/{len(prompts)} questions processed. "
+                            f"Success rate: {stats['success_rate']}")
+                except Exception as e:
+                    logging.error(f"Error in formatting output for question {question_counter}: {e}")
 
-                    except Exception as e:
-                        print(f"\nError processing token {token_val}: {e}")
-                        print(f"Full token tensor: {next_token}")
-                        continue
-                
-                elapsed = time.time() - loop_start
-                print(f"\nQuestion completed in {elapsed:.2f}s")
-                print(f"{'='*80}\n")
-                
-                formatted_output = prompt_handler.format_output(question, generated_text)
-                print("\n" + "="*80)
-                print(formatted_output)
-                
-                results_handler.process_result(formatted_output, question_id=f"q_{idx}")
-                
-                if (idx + 1) % 10 == 0:
-                    stats = results_handler.get_stats()
-                    print(f"\nProgress: {idx + 1}/{len(prompts)} questions processed. "
-                          f"Success rate: {stats['success_rate']}")
-                    
+                question_counter += 1
+
             except Exception as e:
-                logging.error(f"Error in result processing for question {idx}: {e}")
-                # Continue with next question even if this one fails
+                logging.error(f"Error in generation for question {question_counter}: {e}")
+                question_counter += 1
                 continue
-        
+
         results_handler.finalize()
 
 import os

@@ -7,7 +7,6 @@ from typing import NamedTuple
 @dataclass
 class ModelConfig:
   """Base configuration for transformer models."""
-
   dim: int
   n_layers: int
   n_heads: int
@@ -19,6 +18,8 @@ class ModelConfig:
   rope_theta: float
   use_scaled_rope: bool
   max_seq_len: int
+  retrieval_chunks: int = 1  # Number of chunks to retrieve
+  retrieval_context_length: int = 1024  # Max context length for retrieval
 
 
 # Define standard model configurations
@@ -35,6 +36,8 @@ MODEL_CONFIGS = {
     rope_theta=500000.0,
     use_scaled_rope=True,
     max_seq_len=4096,
+    retrieval_chunks=1,
+    retrieval_context_length=1024,
   ),
   "70B": ModelConfig(
     dim=8192,
@@ -48,6 +51,8 @@ MODEL_CONFIGS = {
     rope_theta=500000.0,
     use_scaled_rope=True,
     max_seq_len=4096,
+    retrieval_chunks=2,
+    retrieval_context_length=2048,
   ),
 }
 
@@ -62,6 +67,8 @@ class ModelParams(NamedTuple):
   max_seq_len: int
   rope_theta: float
   use_scaled_rope: bool
+  retrieval_chunks: int
+  retrieval_context_length: int
 
 
 def create_model_params(config: ModelConfig) -> ModelParams:
@@ -74,6 +81,8 @@ def create_model_params(config: ModelConfig) -> ModelParams:
     max_seq_len=config.max_seq_len,
     rope_theta=config.rope_theta,
     use_scaled_rope=config.use_scaled_rope,
+    retrieval_chunks=config.retrieval_chunks,
+    retrieval_context_length=config.retrieval_context_length,
   )
 
 LLAMA_1B_PARAMS = create_model_params(MODEL_CONFIGS["1B"])
