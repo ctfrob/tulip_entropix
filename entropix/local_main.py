@@ -92,8 +92,9 @@ def main(
         weights_path = DEFAULT_WEIGHTS_PATH.joinpath(f"{model_size}-Instruct")
     
     print(f"Loading {model_size} model from {weights_path}")
-
     xfmr_weights, mesh = load_weights(weights_path.absolute(), model_params)
+    print(f"Created mesh with devices: {mesh.devices}")
+
     tokenizer = Tokenizer('entropix/tokenizer.model')
     xfmr_fn = jax.jit(xfmr, static_argnames=("model_params",))
     concept_extractor = OpenAIConceptExtractor()
@@ -103,52 +104,69 @@ def main(
     )
     retrieval_system = RetrievalSystem(config=retrieval_config)
 
-    def process_question(prompt, question=None, results_handler=None, question_counter=None):
-        cur_pos = 0
+    def process_question(prompt, question=None):
+        # Calculate safe lengths
+        SYSTEM_RESERVE = 2048
+        GENERATION_RESERVE = 1024  # Reserve tokens for generation
+        USER_RESERVE = 1024
+        MAX_SAFE_LENGTH = model_params.max_seq_len - (SYSTEM_RESERVE - GENERATION_RESERVE - USER_RESERVE)
+
         tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
+        if len(tokens) > MAX_SAFE_LENGTH:
+            print(f"Warning: Question is too long ({len(tokens)} tokens), truncating to {MAX_SAFE_LENGTH} tokens")
+            tokens = tokens[:MAX_SAFE_LENGTH]
+
+        cur_pos = 0
         tokens = jnp.array([tokens], jnp.int32)
         bsz, seqlen = tokens.shape
 
         # Setup attention and frequency components
         attn_mask = build_attn_mask(seqlen, cur_pos)
-        freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)
+
+        print(f"model_params.head_dim: {model_params.head_dim}")
+        print(f"seqlen: {seqlen}")
+
+        freqs_cis = precompute_freqs_cis(model_params.head_dim, model_params.max_seq_len, model_params.rope_theta, model_params.use_scaled_rope)  
 
         # Initialize KV Cache
         kvcache = KVCache.new(model_params.n_layers, bsz, model_params.max_seq_len, model_params.n_local_kv_heads, model_params.head_dim)
 
-        # Initial FWD pass
-        logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
-
-        # Initialize state for this question
-        state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
         key = jax.random.PRNGKey(0)
-
-        # Generation loop
         generated_text = ""
-        cur_pos = seqlen
-        gen_tokens = []
+        
+        # Initial FWD pass
+        with mesh:
+            logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, tokens, cur_pos, freqs_cis[:seqlen], kvcache, attn_mask=attn_mask)
+            # Initialize state for this question
+            state = initialize_state(logits, bsz, DEFAULT_DS_CONFIG)
+            cur_pos = seqlen
 
-        while cur_pos < 8192:
-            key, subkey = jax.random.split(key)
-            state, next_token = sample(state, logits[:, -1], DEFAULT_DS_CONFIG, key=subkey)
+            while cur_pos < model_params.max_seq_len:
+                key, subkey = jax.random.split(key)
+                next_token, new_state = sample(state, logits[:, -1], DEFAULT_DS_CONFIG, key=subkey)
+                state = new_state
 
-            try:
-                token_val = next_token.tolist()[0][0]
-                if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                try:
+                    if isinstance(next_token, jnp.ndarray):
+                        token_val = next_token[0][0]
+                    else:
+                        raise ValueError(f"Unexpected token type: {type(next_token)}")
+
+                    if token_val in [tokenizer.eot_id, tokenizer.eom_id] or token_val in [128001, 128008, 128009]:
+                        break
+                    
+                    out_token = tokenizer.decode([token_val])
+                    generated_text += out_token
+                    print(out_token, end='', flush=True)
+
+                    # Update for next iteration
+                    next_token = next_token.reshape((bsz, 1))
+                    logits, kvcache, scores, _ = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
+                    cur_pos += 1
+                except Exception as e:
+                    print(f"\nError processing token {token_val}: {e}")
+                    logging.error(f"Error processing token {token_val}: {e}")
                     break
-                
-                out_token = tokenizer.decode([token_val])
-                generated_text += out_token
-                print(out_token, end='', flush=True)
-
-                # Update for next iteration
-                next_token = next_token.reshape(bsz, 1)
-                logits, kvcache, scores, stats = xfmr_fn(xfmr_weights, model_params, next_token, cur_pos, freqs_cis[cur_pos:cur_pos+1], kvcache)
-            except Exception as e:
-                print(f"\nError processing token {token_val}: {e}")
-                break
-
-            cur_pos += 1
 
         return generated_text
 
@@ -206,8 +224,22 @@ Think carefully in a step-by-step manner. which number is larger, 9.9 or 9.11? D
             try:
                 print(f"Processing question {question_counter + 1}")
                 concepts = concept_extractor.extract_concepts(question.question)
+
+                base_prompt_tokens = tokenizer.encode(prompt, bos=False, eos=False, allowed_special='all')
+                SYSTEM_RESERVE = 2048
+                USER_RESERVE = 1024
+                GENERATION_RESERVE = 1024
+                MAX_CONTEXT_LENGTH = model_params.max_seq_len - (len(base_prompt_tokens) + SYSTEM_RESERVE + GENERATION_RESERVE + USER_RESERVE)
+                
+                retrieval_config.max_context_length = MAX_CONTEXT_LENGTH
                 retrieved_context = retrieval_system.retrieve(question.question, concepts)
                 augmented_prompt = prompt_handler.update_prompt_with_context(prompt, retrieved_context)
+                
+                # Truncate the augmented prompt if needed
+                augmented_prompt_tokens = tokenizer.encode(augmented_prompt, bos=False, eos=False, allowed_special='all')
+                if len(augmented_prompt_tokens) > (model_params.max_seq_len - GENERATION_RESERVE):
+                    print(f"Warning: Truncating augmented prompt from {len(augmented_prompt_tokens)} tokens")
+                    augmented_prompt = tokenizer.decode(augmented_prompt_tokens[:model_params.max_seq_len - GENERATION_RESERVE])
 
                 generated_text = process_question(augmented_prompt, question=question)
                 try:
