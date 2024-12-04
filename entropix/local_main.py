@@ -82,7 +82,7 @@ def main(
         weights_path: Optional[Path] = None,
         mode: Literal["sort", "medqa_example", "benchmark"] = "sort",
         max_questions: Optional[int] = None,
-        dataset_path: Path = Path("entropix/data/US_qbank.jsonl")
+        dataset_path: Path = Path("entropix/data/test.jsonl") # Path("entropix/data/US_qbank.jsonl")
 ):
     """
     Main function to run the model in different modes.
